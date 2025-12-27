@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="tamingnifty",  # your package name
-    version="1.0.5",
+    version="1.0.6",
     description="A library for converting OHLC to Noiseless Charts (Renko and PNF)",
     author="Sugam Gupta",
     packages=find_packages(),
@@ -13,6 +13,7 @@ setup(
         "pandas",
         "slack_sdk",
         "python-dotenv",
+        "dateutil",
         # add other dependencies here
     ],
     include_package_data=True,

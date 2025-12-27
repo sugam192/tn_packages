@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tamingnifty"
-version = "1.0.5"
+version = "1.0.6"
 description = "A library for converting OHLC to Noiseless Charts (Renko and PNF)"
 authors = [{ name="Sugam Gupta", email="sugam192@gmail.com" }]
 readme = "README.md"
@@ -15,7 +15,9 @@ dependencies = [
     "requests",
     "pandas",
     "slack_sdk",
-    "python-dotenv"
+    "python-dotenv",
+    "dateutil"
+    
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

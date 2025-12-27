@@ -2,6 +2,7 @@ from integrate import ConnectToIntegrate, IntegrateData, IntegrateOrders
 import pandas as pd
 import pyotp
 from datetime import datetime, timedelta
+from dateutil import parser
 import requests
 import zipfile
 import io
@@ -171,4 +172,4 @@ def get_index_option_symbol(strike=19950, option_type = "PE" ):
     df = df.head(1)
     print("Getting options Symbol...")
     print(f"Symbol: {df['TRADINGSYM'].values[0]} , Expiry: {df['EXPIRY'].values[0]}")
-    return df['TRADINGSYM'].values[0], df['EXPIRY'].values[0]
+    return df['TRADINGSYM'].values[0], parser.parse(str(df['EXPIRY'].values[0])).date()
