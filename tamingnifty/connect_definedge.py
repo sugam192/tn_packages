@@ -165,7 +165,7 @@ def get_index_option_symbol(strike=19950, option_type = "PE" ):
     df = df[df['TRADINGSYM'].str.contains(str(strike))]
     df = df[df['OPTIONTYPE'].str.match(option_type)]
     # Get the current date
-    current_date = datetime.datetime.now()
+    current_date = datetime.now()
     # Calculate the start and end dates of the current week
     df= df[(df['EXPIRY'] > (current_date + timedelta(days=0)))]
     df = df.head(1)
