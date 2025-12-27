@@ -135,3 +135,40 @@ def get_index_future(url='https://app.definedgesecurities.com/public/allmaster.z
     df= df[df['EXPIRY'] > current_date]
     # Return the loaded DataFrame
     return df.iloc[0]['TRADINGSYM']
+
+@retry(tries=5, delay=5, backoff=2)
+def load_csv_from_zip(url='https://app.definedgesecurities.com/public/allmaster.zip', instrument_name = "NIFTY"):
+    column_names = ['SEGMENT', 'TOKEN', 'SYMBOL', 'TRADINGSYM', 'INSTRUMENT TYPE', 'EXPIRY', 'TICKSIZE', 'LOTSIZE', 'OPTIONTYPE', 'STRIKE', 'PRICEPREC', 'MULTIPLIER', 'ISIN', 'PRICEMULT', 'UnKnown']
+    # Send a GET request to download the zip file
+    response = requests.get(url)
+    response.raise_for_status()  # This will raise an exception for HTTP errors
+    # Open the zip file from the bytes-like object
+    with zipfile.ZipFile(io.BytesIO(response.content)) as thezip:
+        # Extract the name of the first CSV file in the zip archive
+        csv_name = thezip.namelist()[0]
+        # Extract and read the CSV file into a pandas DataFrame
+        with thezip.open(csv_name) as csv_file:
+            df = pd.read_csv(csv_file, header=None, names=column_names, low_memory=False, on_bad_lines='skip')
+    df = df[(df['SEGMENT'] == 'NFO') & (df['INSTRUMENT TYPE'] == 'OPTIDX')]
+    df = df[(df['SYMBOL'].str.startswith(instrument_name))]
+    df = df[df['SYMBOL'] == instrument_name]
+    df['EXPIRY'] = df['EXPIRY'].astype(str).apply(lambda x: x.zfill(8))
+    df['EXPIRY'] = pd.to_datetime(df['EXPIRY'], format='%d%m%Y', errors='coerce')
+    df = df.sort_values(by='EXPIRY', ascending=True)
+    # Return the loaded DataFrame
+    return df
+
+
+@retry(tries=5, delay=5, backoff=2)
+def get_index_option_symbol(strike=19950, option_type = "PE" ):
+    df = load_csv_from_zip(instrument_name = "NIFTY")
+    df = df[df['TRADINGSYM'].str.contains(str(strike))]
+    df = df[df['OPTIONTYPE'].str.match(option_type)]
+    # Get the current date
+    current_date = datetime.datetime.now()
+    # Calculate the start and end dates of the current week
+    df= df[(df['EXPIRY'] > (current_date + timedelta(days=0)))]
+    df = df.head(1)
+    print("Getting options Symbol...")
+    print(f"Symbol: {df['TRADINGSYM'].values[0]} , Expiry: {df['EXPIRY'].values[0]}")
+    return df['TRADINGSYM'].values[0], df['EXPIRY'].values[0]

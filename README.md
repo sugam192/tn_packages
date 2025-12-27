@@ -1,4 +1,4 @@
-# definedge_lib
+# @TamingNifty
 
 A Python library for Definedge trading strategies.
 

@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="tamingnifty",  # your package name
-    version="1.0.2",
+    version="1.0.5",
     description="A library for converting OHLC to Noiseless Charts (Renko and PNF)",
     author="Sugam Gupta",
     packages=find_packages(),
