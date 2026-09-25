@@ -71,7 +71,15 @@ _instruments = None
 # Login
 # --------------------------------------------------------------------------------
 
-@retry(tries=5, delay=5, backoff=2)
+# Dhan only lets you generate a token once every 2 minutes. The signal bot and the
+# spread bot start at the same time and are separate processes, so the second one to
+# start always gets refused. It just has to wait the lockout out.
+#
+# These retries wait 5, 10, 20, 40 and 80 seconds, so the last attempt happens 155
+# seconds after the first - comfortably past the 2 minute window. With tries=5 it only
+# reached 75 seconds and gave up while still locked out, which is what caused the
+# "Token can be generated once every 2 minutes" errors on Slack every morning.
+@retry(tries=6, delay=5, backoff=2)
 def login_to_dhan(fresh=False):
     """
     Log in to Dhan and return a connection dict:
