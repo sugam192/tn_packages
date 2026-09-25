@@ -75,11 +75,17 @@ _instruments = None
 # spread bot start at the same time and are separate processes, so the second one to
 # start always gets refused. It just has to wait the lockout out.
 #
-# These retries wait 5, 10, 20, 40 and 80 seconds, so the last attempt happens 155
-# seconds after the first - comfortably past the 2 minute window. With tries=5 it only
-# reached 75 seconds and gave up while still locked out, which is what caused the
-# "Token can be generated once every 2 minutes" errors on Slack every morning.
-@retry(tries=6, delay=5, backoff=2)
+# So the first retry waits 125 seconds - just past that 2 minute window - and the
+# second waits 250 more, giving up 375 seconds after the first attempt. Retrying
+# sooner than 125 seconds is pointless for two separate reasons:
+#
+#   1. The token lockout has not expired yet, so the answer will be the same.
+#   2. A TOTP code is only valid for 30 seconds, and Dhan rejects a code that has
+#      already been used. Retrying a few seconds later sends the SAME code again and
+#      comes back as "Invalid TOTP" - which looks like a bad secret but is not one.
+#
+# Waiting 125 seconds guarantees both a new TOTP window and an expired lockout.
+@retry(tries=3, delay=125, backoff=2)
 def login_to_dhan(fresh=False):
     """
     Log in to Dhan and return a connection dict:
