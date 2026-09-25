@@ -1,6 +1,6 @@
 import pandas as pd
 pd.set_option('mode.chained_assignment', None)
-from tamingnifty import connect_definedge as edge
+from tamingnifty import connect_dhan as edge
 from datetime import datetime
 import numpy as np
 import copy

@@ -1,0 +1,57 @@
+name: Build check
+
+# Runs on every push and pull request to master. Builds, installs and imports the
+# package but does NOT publish it. This is here so a broken pyproject.toml, a
+# missing dependency or a bad import is caught straight away, instead of at
+# release time when you are trying to tag.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build twine
+
+      - name: Build the package
+        run: python -m build
+
+      - name: Check the built package
+        run: |
+          python -m twine check dist/*
+          ls -l dist/
+
+      - name: Install the built package and import every module
+        # [definedge] pulls in pyintegrate, which connect_definedge.py and
+        # tick_streamer.py need. Without it those two modules cannot be imported.
+        #
+        # The "cd .." matters. If you stay in the repo folder, Python finds the
+        # local tamingnifty/ source folder first and imports that instead of the
+        # package we just installed - so the test would pass even if the wheel
+        # were completely broken.
+        run: |
+          WHEEL=$(ls dist/*.whl)
+          python -m pip install "${WHEEL}[definedge]"
+          cd ..
+          python -c "import tamingnifty; print('installed from:', tamingnifty.__file__)"
+          python -c "from tamingnifty import utils;             print('utils OK')"
+          python -c "from tamingnifty import ta;                print('ta OK')"
+          python -c "from tamingnifty import connect_dhan;      print('connect_dhan OK')"
+          python -c "from tamingnifty import connect_definedge; print('connect_definedge OK')"
+          python -c "from tamingnifty import tick_streamer;     print('tick_streamer OK')"
