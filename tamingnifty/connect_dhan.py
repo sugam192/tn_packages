@@ -399,6 +399,32 @@ def get_option_price(conn, security_id, start, end, interval="min"):
 # Orders
 # --------------------------------------------------------------------------------
 
+def check_dhan_response(response):
+    """
+    Raise a useful error if Dhan rejected the request.
+
+    requests' own raise_for_status() only says "400 Client Error: for url ..." and
+    throws the response body away - but the body is the ONLY place Dhan tells you
+    what was actually wrong, in an errorMessage field. Without it a rejected order
+    is undebuggable, which is exactly what happened on the first live attempt on
+    2026-09-25.
+
+    This raises the same kind of error, with Dhan's own explanation attached.
+    """
+    if response.status_code < 400:
+        return
+
+    # The body is normally JSON, but fall back to raw text if it is not.
+    try:
+        detail = response.json()
+    except Exception:
+        detail = response.text
+
+    raise Exception(
+        f"Dhan returned HTTP {response.status_code} for {response.url} - {detail}"
+    )
+
+
 @retry(tries=3, delay=2, backoff=2)
 def place_order(conn, security_id, transaction_type, quantity):
     """
@@ -434,7 +460,11 @@ def place_order(conn, security_id, transaction_type, quantity):
     response = requests.post(
         f"{API_BASE}/orders", headers=build_headers(conn), json=body, timeout=30
     )
-    response.raise_for_status()
+    # A 400 here means Dhan did not like something in the body above, so print what
+    # we sent as well as what Dhan said. One of the two will name the problem.
+    if response.status_code >= 400:
+        print(f"Order Dhan rejected: {body}")
+    check_dhan_response(response)
     return response.json()
 
 
@@ -447,7 +477,7 @@ def get_order(conn, order_id):
     response = requests.get(
         f"{API_BASE}/orders/{order_id}", headers=build_headers(conn), timeout=30
     )
-    response.raise_for_status()
+    check_dhan_response(response)
     data = response.json()
     # Dhan returns a single-element list for this endpoint.
     if isinstance(data, list):
