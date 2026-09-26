@@ -47,7 +47,7 @@ INDEX_IDS = {
 }
 
 # Dhan rejects any intraday request wider than 90 days with error DH-905. We ask for
-# 80 at a time to leave a margin, and fetch_historical_data() loops to cover the rest.
+# 80 at a time to leave a margin, and fetch_candles() loops to cover the rest.
 MAX_DAYS_PER_REQUEST = 80
 
 # Dhan returns candle timestamps as true UTC epoch seconds. Converting them through
@@ -57,10 +57,15 @@ MAX_DAYS_PER_REQUEST = 80
 # TypeError if you compare timezone-aware against timezone-naive.
 IST = "Asia/Kolkata"
 
-# NIFTY options: 65 per lot, and the exchange rejects any single order above 1756.
-# Both read straight off the scrip master.
+# NIFTY options are 65 per lot, read straight off the scrip master.
+#
+# There is deliberately no freeze-quantity constant here any more. The exchange
+# freeze limit is per underlying (NIFTY and BANKNIFTY differ) and the exchange
+# revises it from time to time, so a single number in a shared library is wrong for
+# most callers and goes stale silently. A strategy that can actually reach the limit
+# should check it itself, before it sends the first leg - see check_quantity() in
+# the credit spread bot.
 NIFTY_LOT_SIZE = 65
-NIFTY_FREEZE_QTY = 1756
 
 # Filled in by load_instruments() the first time it is needed, then reused for the
 # life of the process so we do not download a 30 MB file inside the trading loop.
@@ -269,11 +274,10 @@ def candles_to_dataframe(data):
 
 
 @retry(tries=5, delay=5, backoff=2)
-def fetch_candles(conn, security_id, exchange_segment, instrument, start, end, interval="min"):
+def fetch_one_chunk(conn, security_id, exchange_segment, instrument, start, end, interval):
     """
-    Fetch candles for one security over a date range that is already known to be
-    within Dhan's 90 day limit. Most callers want fetch_historical_data() instead,
-    which handles the chunking.
+    One request to Dhan for one security over a range already known to be inside the
+    90 day limit. fetch_candles() below is what you normally want.
     """
     body = {
         "securityId": str(security_id),
@@ -295,26 +299,27 @@ def fetch_candles(conn, security_id, exchange_segment, instrument, start, end, i
     return candles_to_dataframe(response.json())
 
 
-@retry(tries=5, delay=5, backoff=2)
-def fetch_historical_data(conn, exchange, trading_symbol, start, end, interval="min"):
+def fetch_candles(conn, security_id, exchange_segment, instrument, start, end, interval="min"):
     """
-    Fetch historical candles for an index and return a DataFrame with columns
-    datetime, open, high, low, close, volume.
+    Candles for any Dhan instrument, as a DataFrame with columns datetime, open,
+    high, low, close, volume.
 
-    The signature deliberately matches connect_definedge.fetch_historical_data so
-    that ta.py works unchanged. `exchange` is accepted and ignored - Dhan works out
-    the venue from the segment, but keeping the argument means no call site changes.
+    exchange_segment / instrument is the pair that says what you are asking for:
+
+        index    "IDX_I",   "INDEX"
+        option   "NSE_FNO", "OPTIDX"
+        equity   "NSE_EQ",  "EQUITY"
 
     Intraday requests are split into MAX_DAYS_PER_REQUEST windows and stitched back
     together, because Dhan refuses anything wider than 90 days. This matters after
     the bot has been down for a while: the signal doc can hold a start_date months
-    back, and without chunking that request would simply fail.
+    back, and without chunking that request would simply fail. Daily candles have no
+    such limit, so they go in one request.
     """
-    security_id = get_security_id(trading_symbol)
-
-    # Daily candles have no 90 day limit, so ask for the whole range in one go.
     if interval == "day":
-        return fetch_candles(conn, security_id, "IDX_I", "INDEX", start, end, "day")
+        return fetch_one_chunk(
+            conn, security_id, exchange_segment, instrument, start, end, "day"
+        )
 
     frames = []
     chunk_start = start
@@ -323,8 +328,8 @@ def fetch_historical_data(conn, exchange, trading_symbol, start, end, interval="
         if chunk_end > end:
             chunk_end = end
 
-        part = fetch_candles(
-            conn, security_id, "IDX_I", "INDEX", chunk_start, chunk_end, "min"
+        part = fetch_one_chunk(
+            conn, security_id, exchange_segment, instrument, chunk_start, chunk_end, "min"
         )
         if len(part) > 0:
             frames.append(part)
@@ -344,44 +349,58 @@ def fetch_historical_data(conn, exchange, trading_symbol, start, end, interval="
     return df
 
 
+def fetch_historical_data(conn, exchange, trading_symbol, start, end, interval="min"):
+    """
+    Candles for an INDEX, looked up by name ("Nifty 50", "India VIX", "Nifty Bank").
+
+    The signature deliberately matches connect_definedge.fetch_historical_data so
+    that ta.py works unchanged. `exchange` is accepted and ignored - Dhan works out
+    the venue from the segment, but keeping the argument means no call site changes.
+    """
+    security_id = get_security_id(trading_symbol)
+    return fetch_candles(conn, security_id, "IDX_I", "INDEX", start, end, interval)
+
+
 @retry(tries=5, delay=5, backoff=2)
+def get_ltp(conn, security_id, exchange_segment):
+    """
+    Last traded price for one instrument, in whichever segment it lives in
+    ("IDX_I", "NSE_FNO" or "NSE_EQ").
+
+    Note this endpoint also wants the client id in the headers, which the candle
+    endpoints do not.
+    """
+    response = requests.post(
+        f"{API_BASE}/marketfeed/ltp",
+        headers=build_headers(conn, include_client_id=True),
+        json={exchange_segment: [int(security_id)]},
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    price = data["data"][exchange_segment][str(security_id)]["last_price"]
+    return round(float(price), 2)
+
+
 def fetch_ltp(conn, exchange, trading_symbol):
     """
     Last traded price for an index, for example "India VIX".
 
     `exchange` is accepted and ignored, to match the Definedge signature.
     """
-    security_id = get_security_id(trading_symbol)
-    response = requests.post(
-        f"{API_BASE}/marketfeed/ltp",
-        headers=build_headers(conn, include_client_id=True),
-        json={"IDX_I": [security_id]},
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    price = data["data"]["IDX_I"][str(security_id)]["last_price"]
-    return round(float(price), 2)
+    return get_ltp(conn, get_security_id(trading_symbol), "IDX_I")
 
 
-@retry(tries=5, delay=5, backoff=2)
 def get_option_ltp(conn, security_id):
-    """
-    Last traded price for a single option contract. Used by the running PnL loop.
-    """
-    response = requests.post(
-        f"{API_BASE}/marketfeed/ltp",
-        headers=build_headers(conn, include_client_id=True),
-        json={"NSE_FNO": [int(security_id)]},
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    price = data["data"]["NSE_FNO"][str(security_id)]["last_price"]
-    return round(float(price), 2)
+    """Last traded price for a single option contract. Used by the running PnL loop."""
+    return get_ltp(conn, security_id, "NSE_FNO")
 
 
-@retry(tries=5, delay=5, backoff=2)
+def get_equity_ltp(conn, security_id):
+    """Last traded price for one NSE cash instrument (a share or an ETF)."""
+    return get_ltp(conn, security_id, "NSE_EQ")
+
+
 def get_option_price(conn, security_id, start, end, interval="min"):
     """
     Closing price of the most recent candle for an option contract.
@@ -393,6 +412,18 @@ def get_option_price(conn, security_id, start, end, interval="min"):
     if len(df) == 0:
         raise Exception(f"No price data returned for security id {security_id}.")
     return round(float(df["close"].iloc[-1]), 2)
+
+
+def fetch_equity_data(conn, security_id, start, end, interval="day"):
+    """
+    Candles for an NSE cash instrument (a share or an ETF).
+
+    One thing worth knowing: Dhan publishes the consolidated DAILY candle for a
+    session very late - on 2026-09-25 that day's daily bar still did not exist at
+    22:57, long after the minute bars were complete. So a job that needs a session's
+    daily close must run the NEXT morning, not the same evening.
+    """
+    return fetch_candles(conn, security_id, "NSE_EQ", "EQUITY", start, end, interval)
 
 
 # --------------------------------------------------------------------------------
@@ -425,31 +456,31 @@ def check_dhan_response(response):
     )
 
 
-@retry(tries=3, delay=2, backoff=2)
-def place_order(conn, security_id, transaction_type, quantity):
+def send_order(conn, security_id, transaction_type, quantity,
+               exchange_segment, product_type):
     """
-    Place a market order and return Dhan's response, which looks like:
+    Place a MARKET order and return Dhan's response, which looks like:
 
         {"orderId": "112111182198", "orderStatus": "PENDING"}
 
-    Note that this only tells you the order was accepted. Call wait_for_fill() to
-    find out what price it actually filled at.
+    That only says the order was accepted. Call wait_for_fill() to find out what
+    price it actually filled at.
 
-    productType is MARGIN on purpose. INTRADAY would be auto-squared-off by the
-    broker at around 3:20pm every day, which would silently close a weekly spread
-    that is meant to be held to expiry.
+    exchange_segment / product_type is the pair that says what kind of order this
+    is. The two wrappers below are what strategies should normally call:
+
+        options   "NSE_FNO", "MARGIN"
+        equity    "NSE_EQ",  "CNC"
+
+    Neither uses INTRADAY, on purpose - the broker auto-squares-off an INTRADAY
+    position at around 3:20pm, which would silently close a weekly spread meant to
+    be held to expiry, or an ETF meant to be held for weeks.
     """
-    if quantity > NIFTY_FREEZE_QTY:
-        raise Exception(
-            f"Quantity {quantity} is above the exchange freeze limit of "
-            f"{NIFTY_FREEZE_QTY}. Split the order into smaller slices."
-        )
-
     body = {
         "dhanClientId": conn["client_id"],
         "transactionType": transaction_type,   # "BUY" or "SELL"
-        "exchangeSegment": "NSE_FNO",
-        "productType": "MARGIN",
+        "exchangeSegment": exchange_segment,
+        "productType": product_type,
         "orderType": "MARKET",
         "validity": "DAY",
         "securityId": str(security_id),
@@ -466,6 +497,26 @@ def place_order(conn, security_id, transaction_type, quantity):
         print(f"Order Dhan rejected: {body}")
     check_dhan_response(response)
     return response.json()
+
+
+@retry(tries=3, delay=2, backoff=2)
+def place_order(conn, security_id, transaction_type, quantity):
+    """Market order for an index option contract, held overnight (MARGIN)."""
+    return send_order(conn, security_id, transaction_type, quantity,
+                      "NSE_FNO", "MARGIN")
+
+
+def place_equity_order(conn, security_id, transaction_type, quantity):
+    """
+    Market order for NSE cash delivery (CNC).
+
+    There is deliberately no @retry on this one. A retry can only help if the
+    request never reached Dhan, and from here we cannot tell that apart from a
+    reply that got lost on the way back - in which case retrying buys the same ETF
+    twice. The caller notifies on failure and we look at it by hand instead.
+    """
+    return send_order(conn, security_id, transaction_type, quantity,
+                      "NSE_EQ", "CNC")
 
 
 @retry(tries=5, delay=2, backoff=2)
