@@ -20,14 +20,18 @@ Facts below were verified against the live API and the real scrip master on
 import pandas as pd
 import pyotp
 import requests
+import sys
 import time
 from datetime import datetime, timedelta
+from pymongo import MongoClient
 from retry import retry
 import os
 from dotenv import (  # pip install python-dotenv
     find_dotenv,
     load_dotenv,
 )
+
+from tamingnifty import utils as util
 
 # --------------------------------------------------------------------------------
 # Constants
@@ -36,6 +40,51 @@ from dotenv import (  # pip install python-dotenv
 API_BASE = "https://api.dhan.co/v2"
 AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+
+# ---- The shared access token ------------------------------------------------------
+#
+# Dhan keeps exactly ONE live access token per account. Logging in again does not
+# fail and does not give you a second session - it silently kills the token every
+# other process is holding, and they only find out later, mid-session, when an
+# unrelated call comes back with:
+#
+#     {'errorType': 'Order_Error', 'errorCode': 'DH-906', 'errorMessage': 'Invalid Token'}
+#
+# That error code says "order problem", which is why this took a day to identify.
+# Proved by experiment on 2026-09-29: mint A, fetch OK, wait, mint B, and the same
+# fetch with A then fails with exactly the message above while B works.
+#
+# We run four processes against this one account - the credit spread signal and
+# executor all session, plus the two momentum cron jobs - so whichever logged in last
+# was disabling all the others. The fix is that nobody owns a private token any more:
+# one document in Mongo holds the token, every process reads it, and a new one is
+# minted only when there isn't a usable one there.
+#
+# The database name is deliberately NOT configurable. The token belongs to the Dhan
+# account, not to a bot, so every process must look in the same place regardless of
+# whatever MONGO_DB it uses for its own state.
+TOKEN_DB_NAME = "Bots"
+TOKEN_COLLECTION_NAME = "dhan_token"
+
+# Dhan's tokens last 24 hours. We re-mint at 20 so a bot that starts late in the day
+# is never handed one that expires mid-session.
+TOKEN_MAX_AGE_HOURS = 20
+
+# One MongoClient for the life of the process. login_to_dhan() is called on every
+# pass of a 10-second loop, and opening a connection each time would be silly.
+_token_collection = None
+
+# login_to_dhan() asks for the store more than once per call, and runs every few
+# seconds, so the "there is no store" warning has to be said once and then shut up.
+_warned_about_missing_store = False
+
+# When Mongo is unreachable, building the client is not cheap to get wrong: an Atlas
+# mongodb+srv:// URI resolves DNS at construction, and a DNS timeout took 21 seconds
+# on a real outage here. Retrying that on every pass would turn a 10 second loop into
+# a 30 second one. So after a failure we stop trying for a while and just use the
+# token we already have.
+_store_retry_after = None
+TOKEN_STORE_RETRY_MINUTES = 5
 
 # Dhan keys every instrument by a numeric security id, not by a symbol string like
 # Definedge did. For the three indices we care about the ids are fixed, so we just
@@ -76,9 +125,121 @@ _instruments = None
 # Login
 # --------------------------------------------------------------------------------
 
-# Dhan only lets you generate a token once every 2 minutes. The signal bot and the
-# spread bot start at the same time and are separate processes, so the second one to
-# start always gets refused. It just has to wait the lockout out.
+def _get_token_collection():
+    """
+    The Mongo collection holding the one shared access token, or None.
+
+    Never raises. A broker login must not die because Mongo is unreachable - if it
+    is, login_to_dhan() falls back to the old per-process behaviour. That still
+    works, it just loses the sharing.
+    """
+    global _token_collection
+    if _token_collection is not None:
+        return _token_collection
+
+    global _warned_about_missing_store, _store_retry_after
+
+    # Still inside the cooldown from a failed attempt - do not pay the DNS timeout again.
+    if _store_retry_after is not None and datetime.now() < _store_retry_after:
+        return None
+
+    connection_string = os.environ.get("CONNECTION_STRING")
+    if not connection_string:
+        if _warned_about_missing_store == False:
+            print("No CONNECTION_STRING set, so the Dhan token cannot be shared between bots.", flush=True)
+            _warned_about_missing_store = True
+        _store_retry_after = datetime.now() + timedelta(minutes=TOKEN_STORE_RETRY_MINUTES)
+        return None
+    try:
+        _token_collection = MongoClient(connection_string)[TOKEN_DB_NAME][TOKEN_COLLECTION_NAME]
+        return _token_collection
+    except Exception as e:
+        print(f"Could not reach the shared Dhan token store, retrying in "
+              f"{TOKEN_STORE_RETRY_MINUTES} minutes: {util.exception_detail(e)}", flush=True)
+        _store_retry_after = datetime.now() + timedelta(minutes=TOKEN_STORE_RETRY_MINUTES)
+        return None
+
+
+def _read_shared_token(client_id):
+    """
+    Return the token the bots are currently sharing, or None if there is not a usable
+    one. Never raises, for the same reason as above.
+    """
+    collection = _get_token_collection()
+    if collection is None:
+        return None
+
+    try:
+        doc = collection.find_one({"_id": client_id})
+    except Exception as e:
+        print(f"Could not read the shared Dhan token: {util.exception_detail(e)}", flush=True)
+        return None
+
+    if not doc or not doc.get("access_token") or not doc.get("minted_at"):
+        return None
+
+    age = datetime.now() - doc["minted_at"]
+    if age > timedelta(hours=TOKEN_MAX_AGE_HOURS):
+        print(f"Shared Dhan token is {round(age.total_seconds() / 3600, 1)} hours old, "
+              f"past the {TOKEN_MAX_AGE_HOURS} hour limit. Minting a new one.", flush=True)
+        return None
+
+    return doc["access_token"]
+
+
+def _save_shared_token(client_id, access_token, expiry_time):
+    """
+    Publish a freshly minted token so every other bot picks it up instead of minting
+    its own and killing this one. Never raises.
+    """
+    collection = _get_token_collection()
+    if collection is None:
+        return
+    try:
+        collection.update_one(
+            {"_id": client_id},
+            {"$set": {
+                "access_token": access_token,
+                "minted_at": datetime.now(),
+                "expiry_time": expiry_time,
+                "minted_by": _who_am_i(),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"Could not publish the new Dhan token: {util.exception_detail(e)}", flush=True)
+
+
+def _who_am_i():
+    """The script that is running, e.g. "credit_spread_signal.py". Used in the mint
+    notification so the channel says which bot took the token."""
+    return os.path.basename(sys.argv[0]) or "unknown"
+
+
+def _announce_new_token(expiry_time, slack_channel):
+    """
+    Post one line to Slack saying a new token was minted. Never raises - a Slack
+    outage must not stop a bot logging in.
+
+    A mint is the one event that affects every other bot on the account: the token
+    they are holding is dead from this moment until they re-read the store. When a
+    bot goes quiet, this line is what tells you why, and who did it.
+    """
+    channel = slack_channel or os.environ.get("slack_channel") or "niftyweekly"
+    try:
+        util.notify(
+            message=(f"Dhan token minted by {_who_am_i()}, valid till {expiry_time}. "
+                     f"Dhan allows one token per account, so this replaces the previous one - "
+                     f"the other bots pick it up from Mongo on their next pass."),
+            slack_channel=channel,
+            slack_client=util.get_slack_client(token=os.environ.get("slack_token")),
+        )
+    except Exception as e:
+        print(f"Could not announce the new Dhan token: {util.exception_detail(e)}", flush=True)
+
+
+# Dhan only lets you generate a token once every 2 minutes, so two bots starting
+# together means the second one is refused and has to wait the lockout out.
 #
 # So the first retry waits 125 seconds - just past that 2 minute window - and the
 # second waits 250 more, giving up 375 seconds after the first attempt. Retrying
@@ -90,8 +251,14 @@ _instruments = None
 #      comes back as "Invalid TOTP" - which looks like a bad secret but is not one.
 #
 # Waiting 125 seconds guarantees both a new TOTP window and an expired lockout.
+#
+# Note that the retry is now mostly a backstop rather than the plan: since the token
+# is shared through Mongo, the usual reason a second bot used to need a login at all
+# has gone away. And if it does retry, it re-enters this function from the top and
+# re-reads the store, so it will normally find the token the other bot just published
+# instead of minting one.
 @retry(tries=3, delay=125, backoff=2)
-def login_to_dhan(fresh=False):
+def login_to_dhan(fresh=False, slack_channel=None):
     """
     Log in to Dhan and return a connection dict:
 
@@ -100,9 +267,14 @@ def login_to_dhan(fresh=False):
     Every other function in this file takes that dict as its first argument, the same
     way the Definedge functions take a ConnectToIntegrate object.
 
-    An access token is valid for 24 hours. If DHAN_ACCESS_TOKEN is already set in the
-    environment we reuse it; otherwise we mint a fresh one using the TOTP secret.
-    Pass fresh=True to force a new token.
+    Dhan keeps ONE live token per account and a new login silently kills the previous
+    one, so the token is not private to this process - it lives in Mongo and every bot
+    reads the same one. See the comment on TOKEN_DB_NAME for how that was established.
+
+    Pass fresh=True only when a call has just come back with "Invalid Token", which
+    means the shared token was killed by something outside our bots (a login from the
+    Dhan website, or somebody running a script by hand). Even then this checks the
+    store first and will adopt another bot's newer token rather than mint.
     """
     dotenv_file = find_dotenv()
     load_dotenv(dotenv_file)
@@ -116,12 +288,35 @@ def login_to_dhan(fresh=False):
             "Please set DHAN_CLIENT_ID, DHAN_PIN and DHAN_TOTP in the .env file."
         )
 
-    # Reuse the token we already have, unless the caller asked for a fresh one.
-    if fresh == False and os.environ.get("DHAN_ACCESS_TOKEN"):
-        return {
-            "client_id": client_id,
-            "access_token": os.environ["DHAN_ACCESS_TOKEN"],
-        }
+    shared = _read_shared_token(client_id)
+
+    if fresh == False:
+        # The normal path. Read the store every time rather than caching in this
+        # process, so that when another bot does mint a new token we pick it up on
+        # the next pass instead of spending the session failing on a dead one.
+        if shared:
+            os.environ["DHAN_ACCESS_TOKEN"] = shared
+            return {"client_id": client_id, "access_token": shared}
+
+        # No usable shared token. If we cannot even reach the store, keep using
+        # whatever this process already has - minting blind would kill a token the
+        # other bots are perfectly happy with.
+        if _get_token_collection() is None and os.environ.get("DHAN_ACCESS_TOKEN"):
+            return {
+                "client_id": client_id,
+                "access_token": os.environ["DHAN_ACCESS_TOKEN"],
+            }
+    else:
+        # fresh=True: a call just failed with "Invalid Token". Before minting, check
+        # whether another bot has already replaced it. If what is in the store is not
+        # the dead token we were holding, they fixed it while we were failing, and
+        # minting now would kill their new token, so they would mint again, and the
+        # two bots would knock each other over for the rest of the session.
+        if shared and shared != os.environ.get("DHAN_ACCESS_TOKEN"):
+            print("Another bot has already minted a token, adopting that one instead "
+                  "of minting again.", flush=True)
+            os.environ["DHAN_ACCESS_TOKEN"] = shared
+            return {"client_id": client_id, "access_token": shared}
 
     # Mint a new 24 hour token. TOTP must be enabled on the Dhan account for this
     # endpoint to work - without it there is no way to log in without a browser.
@@ -137,10 +332,18 @@ def login_to_dhan(fresh=False):
     if "accessToken" not in data:
         raise Exception(f"Dhan login failed: {data}")
 
-    os.environ["DHAN_ACCESS_TOKEN"] = data["accessToken"]
-    print(f"Login successful. Token valid till {data.get('expiryTime')}")
+    access_token = data["accessToken"]
+    os.environ["DHAN_ACCESS_TOKEN"] = access_token
 
-    return {"client_id": client_id, "access_token": data["accessToken"]}
+    # Publish before announcing. If Slack is down we still want the other bots to be
+    # able to find the token, and that ordering also means the notification is never
+    # sent for a token nobody else can reach.
+    _save_shared_token(client_id, access_token, data.get("expiryTime"))
+    print(f"Login successful. Token valid till {data.get('expiryTime')}", flush=True)
+    _announce_new_token(data.get("expiryTime"), slack_channel)
+
+    return {"client_id": client_id, "access_token": access_token}
+
 
 
 def build_headers(conn, include_client_id=False):
