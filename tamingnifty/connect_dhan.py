@@ -38,6 +38,68 @@ from tamingnifty import utils as util
 # --------------------------------------------------------------------------------
 
 API_BASE = "https://api.dhan.co/v2"
+
+# Statuses that mean Dhan has finished with an order, one way or another. EXPIRED
+# is in here because it is terminal too - leaving it out used to make wait_for_fill
+# sit through every one of its polls on an order that was already dead.
+#
+# PART_TRADED is deliberately NOT in here. Some of it filled and the rest is still
+# working, which is precisely the case worth chasing. Note it only ever appears on
+# the order book / get-order endpoints, never in the reply to placing an order.
+FINAL_ORDER_STATUSES = ("TRADED", "REJECTED", "CANCELLED", "EXPIRED")
+
+# A limit price that is not a multiple of the instrument's tick is rejected outright,
+# so every price we calculate gets rounded onto it.
+#
+# THE TICK IS PER INSTRUMENT, NOT PER SEGMENT. This started life as a per-segment
+# table with MCX_COMM = 1.00, read off crude, and that is wrong for most of MCX.
+# Counted in the scrip master on 2026-09-29:
+#
+#   MCX futures alone use FIVE different ticks - Rs 0.05 (copper, zinc, aluminium),
+#   Rs 0.10 (natural gas), Rs 0.50, Rs 1.00 (crude, gold, silver), Rs 10.00 (cotton,
+#   steel rebar).
+#
+#   NSE cash uses SIX - and 467 instruments tick coarser than 5 paise, including
+#   Maruti Suzuki, Page Industries, Divi's Labs, InterGlobe Aviation and Oracle
+#   Financial. A price rounded onto a 5 paise grid is not on a 10 paise grid, so
+#   every one of those would have had its reprice rejected.
+#
+# Rounding COARSER than the real tick is safe when the real tick divides it exactly
+# (0.05 is a legal multiple of 0.01), which is why the ETFs the momentum bot holds
+# never hit this - all 345 NSE ETFs tick at 0.01 or 0.05. It is only luck.
+#
+# get_tick_size() below reads the real number per instrument. This table is what it
+# falls back to when the scrip master cannot be reached, because a coarse guess that
+# usually works beats refusing to reprice at all.
+FALLBACK_TICK_SIZE = {
+    "NSE_EQ": 0.05,
+    "NSE_FNO": 0.05,
+    "BSE_EQ": 0.05,
+    "BSE_FNO": 0.05,
+    "MCX_COMM": 0.05,
+}
+
+# Anything unlisted falls back to the finest tick we know of. Too fine gets the order
+# rejected and we find out at once; too coarse would silently move the price further
+# than intended, which is worse.
+DEFAULT_TICK_SIZE = 0.05
+
+# Dhan's API names a segment one way ("NSE_EQ"); its own scrip master names the same
+# segment another way, as an EXCH_ID plus a one letter SEGMENT code. This is the
+# translation, needed by any lookup that starts from an order and goes to the master.
+#
+# IDX_I is deliberately absent - indices cannot be traded, so nothing ever needs a
+# tick for one, and the code that reads indices already knows their ids.
+SEGMENT_TO_MASTER = {
+    "NSE_EQ": ("NSE", "E"),
+    "NSE_FNO": ("NSE", "D"),
+    "NSE_CURRENCY": ("NSE", "C"),
+    "BSE_EQ": ("BSE", "E"),
+    "BSE_FNO": ("BSE", "D"),
+    "BSE_CURRENCY": ("BSE", "C"),
+    "MCX_COMM": ("MCX", "M"),
+}
+
 AUTH_URL = "https://auth.dhan.co/app/generateAccessToken"
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
@@ -391,6 +453,57 @@ def load_instruments():
     return _instruments
 
 
+def get_tick_size(security_id, exchange_segment):
+    """
+    The smallest price increment this one instrument may be priced in, in RUPEES.
+
+    Any limit price that is not a whole multiple of this is rejected by the exchange,
+    so every price the chase works out is rounded onto it.
+
+    It has to be looked up per instrument. There is no per-segment answer: MCX
+    futures use five different ticks and NSE cash uses six. See the comment on
+    FALLBACK_TICK_SIZE for the counts and for who it would have broken.
+
+    TWO THINGS THAT WILL CATCH YOU OUT HERE:
+
+    1. The scrip master reports the tick in PAISE. Crude reads 100.0 meaning Re 1.00,
+       a NIFTY option reads 5.0 meaning Rs 0.05. Hence the divide by 100.
+
+    2. A SECURITY ID IS NOT UNIQUE ON ITS OWN. 10,631 of the 188,183 ids in the
+       master appear more than once, and the collisions are not obscure - id 13 is
+       both Nifty 50 and ABB, id 25 is both Nifty Bank and Adani Enterprises, id 21
+       is both India VIX and an SDL bond. Only (id, exchange, segment) is unambiguous,
+       and it is: zero triples collide. So this filters on all three, and anything
+       that looks an instrument up by id alone is a bug waiting to happen.
+
+    Never raises. A tick we cannot look up must not stop an exit - the caller gets
+    the segment fallback and carries on, because a slightly coarse price that the
+    exchange accepts is worth far more than a correct one we never sent.
+    """
+    fallback = FALLBACK_TICK_SIZE.get(exchange_segment, DEFAULT_TICK_SIZE)
+
+    if exchange_segment not in SEGMENT_TO_MASTER:
+        return fallback
+    exchange, segment = SEGMENT_TO_MASTER[exchange_segment]
+
+    try:
+        df = load_instruments()
+        match = df[
+            (df["SECURITY_ID"].astype(str) == str(security_id))
+            & (df["EXCH_ID"].astype(str) == exchange)
+            & (df["SEGMENT"].astype(str) == segment)
+        ]
+        if len(match) == 0:
+            print(f"No scrip master entry for security {security_id} in "
+                  f"{exchange_segment}, using a {fallback} tick.", flush=True)
+            return fallback
+        return round(float(match.iloc[0]["TICK_SIZE"]) / 100.0, 4)
+    except Exception as e:
+        print(f"Could not read the tick size for security {security_id} "
+              f"({util.exception_detail(e)}), using {fallback}.", flush=True)
+        return fallback
+
+
 @retry(tries=5, delay=5, backoff=2)
 def get_index_option_symbol(strike, option_type, instrument_name="NIFTY", min_dte=3):
     """
@@ -434,6 +547,59 @@ def get_index_option_symbol(strike, option_type, instrument_name="NIFTY", min_dt
 
     print("Getting options Symbol...")
     print(f"Symbol: {trading_symbol} , Security Id: {security_id} , Expiry: {expiry}")
+    return trading_symbol, security_id, expiry, lot_size
+
+
+@retry(tries=5, delay=5, backoff=2)
+def get_commodity_futures_symbol(commodity, min_dte=3):
+    """
+    Find the front month MCX futures contract for a commodity, for example
+    "CRUDEOILM", "NATURALGAS", "GOLDM", "SILVERM".
+
+    Returns (trading_symbol, security_id, expiry_date, lot_size) - the same shape
+    get_index_option_symbol returns, so both can be used the same way.
+
+    Commodity futures roll monthly and the contract nearest expiry is the liquid
+    one, so this takes the earliest expiry that is still more than `min_dte` days
+    out. The cutoff matters more here than it does for options: MCX expiries are
+    mid-month rather than weekly, and the last few days of a contract thin out
+    badly, which is exactly when a chase cannot find a fill.
+
+    LOT_SIZE is 1 for every one of the 14,961 MCX rows in the scrip master, because
+    on MCX the contract itself IS the unit - Dhan's `quantity` is a number of lots.
+    One lot of CRUDEOILM is 10 barrels, so a 1 rupee move in crude is Rs 10 on the
+    position. That multiplier is a property of the contract, not something the API
+    exposes, so a strategy that sizes by risk has to carry it itself.
+    """
+    df = load_instruments()
+
+    df = df[
+        (df["EXCH_ID"].astype(str) == "MCX")
+        & (df["INSTRUMENT"].astype(str) == "FUTCOM")
+        & (df["UNDERLYING_SYMBOL"].astype(str) == commodity)
+    ]
+
+    if len(df) == 0:
+        raise Exception(f"No MCX futures contract found for '{commodity}'.")
+
+    df = df.copy()
+    df["EXPIRY"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
+    cutoff = datetime.now() + timedelta(days=min_dte)
+    df = df[df["EXPIRY"] > cutoff]
+    df = df.sort_values(by="EXPIRY", ascending=True)
+
+    if len(df) == 0:
+        raise Exception(
+            f"No {commodity} futures contract expiring after {cutoff.date()}."
+        )
+
+    row = df.iloc[0]
+    trading_symbol = row["DISPLAY_NAME"]
+    security_id = int(row["SECURITY_ID"])
+    expiry = row["EXPIRY"].date()
+    lot_size = int(row["LOT_SIZE"])
+
+    print(f"Commodity: {trading_symbol} , Security Id: {security_id} , Expiry: {expiry}")
     return trading_symbol, security_id, expiry, lot_size
 
 
@@ -604,6 +770,11 @@ def get_equity_ltp(conn, security_id):
     return get_ltp(conn, security_id, "NSE_EQ")
 
 
+def get_commodity_ltp(conn, security_id):
+    """Last traded price for one MCX futures contract."""
+    return get_ltp(conn, security_id, "MCX_COMM")
+
+
 def get_option_price(conn, security_id, start, end, interval="min"):
     """
     Closing price of the most recent candle for an option contract.
@@ -627,6 +798,19 @@ def fetch_equity_data(conn, security_id, start, end, interval="day"):
     daily close must run the NEXT morning, not the same evening.
     """
     return fetch_candles(conn, security_id, "NSE_EQ", "EQUITY", start, end, interval)
+
+
+def fetch_commodity_data(conn, security_id, start, end, interval="min"):
+    """
+    Candles for one MCX futures contract.
+
+    Note the default interval differs from fetch_equity_data's. MCX contracts roll
+    every month, so a daily series on a single security id only ever covers that
+    contract's own life - a few months at most, and the early part of it is thin.
+    Anything wanting a long continuous commodity history has to stitch contracts
+    together itself; this returns exactly one contract's candles and nothing more.
+    """
+    return fetch_candles(conn, security_id, "MCX_COMM", "FUTCOM", start, end, interval)
 
 
 # --------------------------------------------------------------------------------
@@ -675,14 +859,27 @@ def send_order(conn, security_id, transaction_type, quantity,
     price it actually filled at.
 
     exchange_segment / product_type is the pair that says what kind of order this
-    is. The two wrappers below are what strategies should normally call:
+    is. The three wrappers below are what strategies should normally call:
 
-        options   "NSE_FNO", "MARGIN"
-        equity    "NSE_EQ",  "CNC"
+        options     "NSE_FNO",  "MARGIN"    place_order()
+        equity      "NSE_EQ",   "CNC"       place_equity_order()
+        commodity   "MCX_COMM", "MARGIN"    place_commodity_order()
 
-    Neither uses INTRADAY, on purpose - the broker auto-squares-off an INTRADAY
+    None uses INTRADAY, on purpose - the broker auto-squares-off an INTRADAY
     position at around 3:20pm, which would silently close a weekly spread meant to
-    be held to expiry, or an ETF meant to be held for weeks.
+    be held to expiry, an ETF meant to be held for weeks, or an MCX position during
+    the session that runs on until 23:30.
+
+    WHAT `quantity` MEANS. Always lots x the contract's LOT_SIZE from the scrip
+    master - one rule, but it looks like two because LOT_SIZE differs:
+
+        NSE_EQ      LOT_SIZE 1   -> quantity is a number of SHARES
+        NSE_FNO     LOT_SIZE 65  -> one NIFTY lot is quantity=65, not 1
+        MCX_COMM    LOT_SIZE 1   -> quantity is a number of LOTS
+
+    MCX reads 1 for all 14,961 of its rows, so quantity=1 is one whole lot - which
+    for CRUDEOILM is 10 barrels and about Rs 87,000 of notional on Rs 27,800 of
+    margin. Sending 65 there the way you would for NIFTY buys 65 lots.
     """
     body = {
         "dhanClientId": conn["client_id"],
@@ -734,6 +931,23 @@ def place_equity_order(conn, security_id, transaction_type, quantity):
                       "NSE_EQ", "CNC")
 
 
+def place_commodity_order(conn, security_id, transaction_type, quantity):
+    """
+    Market order for an MCX futures contract, held overnight (MARGIN).
+
+    quantity here is a number of LOTS, because every MCX row in the scrip master
+    reads LOT_SIZE 1. That is the same rule as everywhere else - lots x LOT_SIZE -
+    it just lands on a different number. One CRUDEOILM lot is 10 barrels, roughly
+    Rs 87,000 of notional on about Rs 27,800 of margin, so quantity=65 out of habit
+    from the NIFTY path would be 65 lots and around Rs 1.8 crore of exposure.
+
+    MARGIN, not INTRADAY: MCX runs to 23:30 and an INTRADAY position would be
+    squared off partway through. No @retry, for the reason under place_order.
+    """
+    return send_order(conn, security_id, transaction_type, quantity,
+                      "MCX_COMM", "MARGIN")
+
+
 @retry(tries=5, delay=2, backoff=2)
 def get_order(conn, order_id):
     """
@@ -751,27 +965,233 @@ def get_order(conn, order_id):
     return data
 
 
-def wait_for_fill(conn, order_id, tries=15, delay=2):
+def modify_order(conn, order_id, order_type, quantity, price=0):
     """
-    Poll an order until it reaches a final state, and return that final order dict.
+    Change an order that is already sitting at the exchange. In practice this means
+    moving its price, because the two useful changes Dhan's docs imply are possible
+    turn out not to be - see the two findings below.
 
-    A market order normally fills in well under a second, but we poll rather than
-    assume. Terminal states on Dhan are TRADED, REJECTED and CANCELLED - note that
-    the success value is TRADED, not COMPLETE as it was on Definedge.
+    Always modify rather than cancel-and-replace. Cancelling first leaves a window
+    with no working order against a position that is still open, and if the process
+    dies in that window nothing is looking after it at all. A modify also cannot
+    double the position the way re-placing can: it sets a price on an order id that
+    already exists, so if the reply gets lost on the way back, the next poll simply
+    shows us the truth. That is the same hazard place_order's comment describes, and
+    it is why there is no @retry on that one but this is safe to call.
 
-    If the order is still pending after all the tries, we return whatever we last
-    saw rather than raising, so the caller can decide what to do. The caller must
-    always check orderStatus before using averageTradedPrice.
+    DO NOT ADD legName BACK. Dhan's own worked example for this endpoint includes
+    `"legName": ""`, and sending it fails EVERY modify with DH-905 "Missing required
+    fields, bad values for parameters etc." - which reads like something is absent
+    rather than something extra being present, so it is easy to chase the wrong
+    field for a long time. The empty string is not a legal value for the enum; the
+    field only applies to bracket and cover orders. Omitting it entirely works.
+    Proved on MCX 2026-09-29: identical payloads, the only difference being that
+    key, gave 400 and 200.
+
+    LIMIT -> MARKET DOES NOT WORK either, whatever the docs imply by listing order
+    type as modifiable. Every shape is refused with DH-906, and the message shifts
+    with the price - "Invalid Price Value" for any non-zero price, "Basic Validation
+    Failed" for zero or absent - so Dhan wants price 0 for a MARKET and still will
+    not make the change. Tested six ways on MCX 2026-09-29, with a plain price move
+    on the same order succeeding immediately afterwards to prove the order itself
+    was still modifiable. This is why chase_the_order prices by hand.
+
+    `quantity` is the WHOLE order, not the part still unfilled. Dhan's docs do not
+    actually say which it means, but every exchange works the total-quantity way and
+    Dhan's own worked example sends the full number. wait_for_fill checks Dhan's
+    reported quantity after each modify and stops if it ever changes, because being
+    wrong about this on a part-filled order would add to the position instead of
+    finishing it.
     """
-    order = None
-    count = 0
-    while count < tries:
-        order = get_order(conn, order_id)
-        status = order.get("orderStatus")
-        if status in ("TRADED", "REJECTED", "CANCELLED"):
-            return order
-        time.sleep(delay)
-        count = count + 1
+    body = {
+        "dhanClientId": conn["client_id"],
+        "orderId": str(order_id),
+        "orderType": order_type,
+        "quantity": int(quantity),
+        "price": float(price),
+        "validity": "DAY",
+    }
 
-    print(f"Order {order_id} still not final after {tries} checks.")
+    response = requests.put(
+        f"{API_BASE}/orders/{order_id}", headers=build_headers(conn), json=body, timeout=30
+    )
+    # Same reasoning as send_order: on a 400, print what we sent as well as what Dhan
+    # said, because one of the two will name the problem.
+    if response.status_code >= 400:
+        print(f"Modify Dhan rejected: {body}")
+    check_dhan_response(response)
+    return response.json()
+
+
+def note_if_market_became_limit(order):
+    """
+    Say so when Dhan rewrites one of our MARKET orders into a LIMIT.
+
+    send_order only ever sends MARKET, so any order that comes back as LIMIT was
+    rewritten by Dhan into a protected limit priced off the LTP at that moment.
+    Proved on MCX on 2026-09-29: we sent MARKET, Dhan stored LIMIT at 8874.0 against
+    an LTP of 8779, a band of about 1% through the market. It is undocumented.
+
+    Usually this is a kindness - the limit sits through the book, so it fills at once
+    and caps our slippage. It only bites when the price runs past the band before the
+    order rests, which is exactly what happens in a fast move. That is the whole
+    reason the chase below exists.
+
+    This line is also how we learn which segments do it. MCX_COMM is confirmed;
+    NSE_EQ and NSE_FNO have not been watched yet, and the next live order on either
+    will print the answer here without us having to go and test it.
+    """
+    if order.get("orderType") == "LIMIT":
+        print(f"Dhan rewrote MARKET order {order.get('orderId')} as a LIMIT at "
+              f"{order.get('price')} on {order.get('exchangeSegment')}.", flush=True)
+
+
+def chase_the_order(conn, order, attempt, step):
+    """
+    Push one order that is sitting unfilled towards a fill. Called once per attempt.
+
+    It reprices, widening each time. The obvious move - asking Dhan to turn it back
+    into a MARKET order, so it redoes its own protected-limit sum at the price now
+    instead of the price when we placed it - is refused by the API; modify_order's
+    docstring has the evidence. So we work out the price ourselves.
+
+    We deliberately do NOT price at the LTP: a limit sitting exactly at the LTP only
+    joins the queue, which is the problem we are trying to solve. Priced through it,
+    the order is marketable and normally fills at the touch - better than the price
+    we offered. Repricing to the far side of the LTP is allowed: a BUY limit one
+    rupee under crude's LTP was accepted on 2026-09-29, so what bounds us is the
+    exchange's circuit band, not how close to the market we dare go.
+
+    Nothing here is direction-specific except one comparison, because an order that
+    will not fill is just as bad whichever way round it is. A buy that misses leaves
+    the credit spread short with no hedge; a sell that misses leaves the bot certain
+    it is flat when it is still holding.
+    """
+    order_id = order.get("orderId")
+    quantity = order.get("quantity")
+
+    # 0.3%, then 0.6%, then 1.2%. Widening covers a bigger move each time, and the
+    # hard stop after the last attempt matters more than the sizes do - chasing
+    # without a limit in a falling market just guarantees a sale at the bottom.
+    offset = step * (2 ** (attempt - 1))
+
+    ltp = get_ltp(conn, order.get("securityId"), order.get("exchangeSegment"))
+    if order.get("transactionType") == "BUY":
+        price = ltp * (1 + offset)
+    else:
+        price = ltp * (1 - offset)
+
+    # The tick has to come from the instrument, not the segment. MCX futures alone
+    # run from 5 paise to Rs 10 depending on the commodity, and 467 NSE cash names
+    # are coarser than 5 paise. See get_tick_size.
+    tick = get_tick_size(order.get("securityId"), order.get("exchangeSegment"))
+    price = round(round(price / tick) * tick, 2)
+
+    modify_order(conn, order_id, "LIMIT", quantity, price)
+    print(f"Order {order_id} still unfilled - repriced to {price} "
+          f"({round(offset * 100, 2)}% through an LTP of {ltp}).", flush=True)
+
+
+def warn_order_never_filled(order, slack_channel):
+    """
+    Shout about an order that never filled.
+
+    This is the one failure that quietly corrupts everything downstream. The strategy
+    carries on as though the trade happened, so the ledger, the P&L and the next
+    rebalance are all working from a position that is not the one actually held. It
+    has to be loud, and the caller must not record a fill after seeing it.
+    """
+    message = (f"Order {order.get('orderId')} did NOT fill: "
+               f"{order.get('transactionType')} {order.get('filledQty') or 0} of "
+               f"{order.get('quantity')} {order.get('tradingSymbol')}, "
+               f"status {order.get('orderStatus')}. "
+               f"The real position is not what the bot thinks it is - check Dhan by hand.")
+    print(message, flush=True)
+    try:
+        util.notify(
+            message=message,
+            slack_channel=slack_channel or os.environ.get("slack_channel") or "niftyweekly",
+            slack_client=util.get_slack_client(token=os.environ.get("slack_token")),
+        )
+    except Exception as e:
+        print(f"Could not post the unfilled order warning to Slack: "
+              f"{util.exception_detail(e)}", flush=True)
+
+
+def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
+                  slack_channel=None):
+    """
+    Poll an order until it reaches a final state, chasing the price if it will not
+    fill, and return whatever state it ended in.
+
+    Terminal states on Dhan are TRADED, REJECTED, CANCELLED and EXPIRED - note the
+    success value is TRADED, not COMPLETE as it was on Definedge.
+
+    We poll rather than assume, because a MARKET order does not necessarily behave
+    like one: Dhan rewrites it into a protected LIMIT (see note_if_market_became_limit),
+    and in a fast move that limit can be left behind by the market and never fill. So
+    after `tries` polls we chase - up to `chases` times, escalating - and only then
+    give up. Worst case is about 20 seconds, which is less than the 30 this used to
+    spend waiting passively.
+
+    A REJECTED order is returned immediately and never chased. The reason matters
+    (funds, freeze quantity, RMS) and repricing fixes none of them.
+
+    If it still has not filled we return the last state we saw rather than raising,
+    so the caller decides what to do - but warn_order_never_filled has already said
+    so on Slack by then. The caller must always check orderStatus before using
+    averageTradedPrice, and must check filledQty too: chasing makes a part fill a
+    much more likely place to end up than it used to be.
+    """
+    order = get_order(conn, order_id)
+    note_if_market_became_limit(order)
+
+    # Dhan is never asked to change this. If it ever reports a different number we
+    # have misunderstood what quantity means on a modify, and the safe thing is to
+    # stop touching the order rather than risk adding to the position.
+    original_quantity = order.get("quantity")
+
+    attempt = 0
+    while attempt <= chases:
+        if attempt > 0:
+            if order.get("quantity") != original_quantity:
+                print(f"Order {order_id} quantity changed from {original_quantity} to "
+                      f"{order.get('quantity')} after a modify. Not touching it again.",
+                      flush=True)
+                break
+            chase_failed = False
+            try:
+                chase_the_order(conn, order, attempt, step)
+            except Exception as e:
+                # A chase can be refused for a reason no amount of repricing fixes.
+                # The commonest is the price landing outside the exchange's circuit
+                # limit, and that is not a rare corner: on MCX crude the lower
+                # circuit sits about 1.5% below the last price, so a sell chased
+                # 1.2% down is already close to it, and in the fast fall where this
+                # code earns its keep the price IS the circuit.
+                #
+                # Stop rather than raise. The caller needs the order back so it can
+                # see what the position really is, and warn_order_never_filled below
+                # is what is supposed to get somebody's attention - an exception
+                # thrown from here would skip it.
+                print(f"Order {order_id} could not be chased "
+                      f"({util.exception_detail(e)}). Giving up on it.", flush=True)
+                chase_failed = True
+            if chase_failed:
+                break
+
+        # Check what we already have before asking again - the order we fetched a
+        # moment ago is usually already TRADED, and re-fetching it first would spend
+        # an extra round trip on every single order we ever place.
+        count = 0
+        while count < tries:
+            if order.get("orderStatus") in FINAL_ORDER_STATUSES:
+                return order
+            time.sleep(delay)
+            order = get_order(conn, order_id)
+            count = count + 1
+
+        attempt = attempt + 1
+
+    warn_order_never_filled(order, slack_channel)
     return order
