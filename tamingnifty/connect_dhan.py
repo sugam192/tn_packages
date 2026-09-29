@@ -131,7 +131,7 @@ def login_to_dhan(fresh=False):
         params={"dhanClientId": client_id, "pin": pin, "totp": totp_now},
         timeout=30,
     )
-    response.raise_for_status()
+    check_dhan_response(response)
     data = response.json()
 
     if "accessToken" not in data:
@@ -295,7 +295,7 @@ def fetch_one_chunk(conn, security_id, exchange_segment, instrument, start, end,
         body["interval"] = "1"
 
     response = requests.post(url, headers=build_headers(conn), json=body, timeout=60)
-    response.raise_for_status()
+    check_dhan_response(response)
     return candles_to_dataframe(response.json())
 
 
@@ -376,7 +376,7 @@ def get_ltp(conn, security_id, exchange_segment):
         json={exchange_segment: [int(security_id)]},
         timeout=30,
     )
-    response.raise_for_status()
+    check_dhan_response(response)
     data = response.json()
     price = data["data"][exchange_segment][str(security_id)]["last_price"]
     return round(float(price), 2)
@@ -440,6 +440,11 @@ def check_dhan_response(response):
     is undebuggable, which is exactly what happened on the first live attempt on
     2026-09-25.
 
+    Used by every Dhan call, not just orders. On 2026-09-28 both credit spread bots
+    spent a whole session posting "400 Client Error:  for url: .../charts/intraday"
+    with no way to tell a dead token (DH-901) from a bad request (DH-905) from Dhan
+    failing to serve data (DH-907) - three different problems, one useless message.
+
     This raises the same kind of error, with Dhan's own explanation attached.
     """
     if response.status_code < 400:
@@ -499,9 +504,16 @@ def send_order(conn, security_id, transaction_type, quantity,
     return response.json()
 
 
-@retry(tries=3, delay=2, backoff=2)
 def place_order(conn, security_id, transaction_type, quantity):
-    """Market order for an index option contract, held overnight (MARGIN)."""
+    """
+    Market order for an index option contract, held overnight (MARGIN).
+
+    There is deliberately no @retry here, for the same reason spelled out under
+    place_equity_order below: a retry only helps if the request never reached Dhan,
+    and from this side that is indistinguishable from a reply that got lost on the
+    way back - in which case the retry sells a second short leg. This one used to
+    carry @retry(tries=3); it was removed on 2026-09-29.
+    """
     return send_order(conn, security_id, transaction_type, quantity,
                       "NSE_FNO", "MARGIN")
 
