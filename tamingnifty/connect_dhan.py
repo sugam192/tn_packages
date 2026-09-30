@@ -22,7 +22,7 @@ import pyotp
 import requests
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pymongo import MongoClient
 from retry import retry
 import os
@@ -202,7 +202,7 @@ def _get_token_collection():
     global _warned_about_missing_store, _store_retry_after
 
     # Still inside the cooldown from a failed attempt - do not pay the DNS timeout again.
-    if _store_retry_after is not None and datetime.now() < _store_retry_after:
+    if _store_retry_after is not None and util.ist_now() < _store_retry_after:
         return None
 
     connection_string = os.environ.get("CONNECTION_STRING")
@@ -210,7 +210,7 @@ def _get_token_collection():
         if _warned_about_missing_store == False:
             print("No CONNECTION_STRING set, so the Dhan token cannot be shared between bots.", flush=True)
             _warned_about_missing_store = True
-        _store_retry_after = datetime.now() + timedelta(minutes=TOKEN_STORE_RETRY_MINUTES)
+        _store_retry_after = util.ist_now() + timedelta(minutes=TOKEN_STORE_RETRY_MINUTES)
         return None
     try:
         _token_collection = MongoClient(connection_string)[TOKEN_DB_NAME][TOKEN_COLLECTION_NAME]
@@ -218,7 +218,7 @@ def _get_token_collection():
     except Exception as e:
         print(f"Could not reach the shared Dhan token store, retrying in "
               f"{TOKEN_STORE_RETRY_MINUTES} minutes: {util.exception_detail(e)}", flush=True)
-        _store_retry_after = datetime.now() + timedelta(minutes=TOKEN_STORE_RETRY_MINUTES)
+        _store_retry_after = util.ist_now() + timedelta(minutes=TOKEN_STORE_RETRY_MINUTES)
         return None
 
 
@@ -240,7 +240,7 @@ def _read_shared_token(client_id):
     if not doc or not doc.get("access_token") or not doc.get("minted_at"):
         return None
 
-    age = datetime.now() - doc["minted_at"]
+    age = util.ist_now() - doc["minted_at"]
     if age > timedelta(hours=TOKEN_MAX_AGE_HOURS):
         print(f"Shared Dhan token is {round(age.total_seconds() / 3600, 1)} hours old, "
               f"past the {TOKEN_MAX_AGE_HOURS} hour limit. Minting a new one.", flush=True)
@@ -262,7 +262,7 @@ def _save_shared_token(client_id, access_token, expiry_time):
             {"_id": client_id},
             {"$set": {
                 "access_token": access_token,
-                "minted_at": datetime.now(),
+                "minted_at": util.ist_now(),
                 "expiry_time": expiry_time,
                 "minted_by": _who_am_i(),
             }},
@@ -324,7 +324,7 @@ def login_to_dhan(fresh=False, slack_channel=None):
     """
     Log in to Dhan and return a connection dict:
 
-        {"client_id": "1100341129", "access_token": "eyJ0eXAi..."}
+        {"client_id": "1100XXXXXX", "access_token": "eyJ0eXAi..."}
 
     Every other function in this file takes that dict as its first argument, the same
     way the Definedge functions take a ConnectToIntegrate object.
@@ -530,7 +530,7 @@ def get_index_option_symbol(strike, option_type, instrument_name="NIFTY", min_dt
     # SM_EXPIRY_DATE comes through as a YYYY-MM-DD string.
     df = df.copy()
     df["EXPIRY"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
-    cutoff = datetime.now() + timedelta(days=min_dte)
+    cutoff = util.ist_now() + timedelta(days=min_dte)
     df = df[df["EXPIRY"] > cutoff]
     df = df.sort_values(by="EXPIRY", ascending=True)
 
@@ -584,7 +584,7 @@ def get_commodity_futures_symbol(commodity, min_dte=3):
 
     df = df.copy()
     df["EXPIRY"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
-    cutoff = datetime.now() + timedelta(days=min_dte)
+    cutoff = util.ist_now() + timedelta(days=min_dte)
     df = df[df["EXPIRY"] > cutoff]
     df = df.sort_values(by="EXPIRY", ascending=True)
 

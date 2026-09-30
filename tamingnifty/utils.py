@@ -1,11 +1,35 @@
 import os
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
 from retry import retry
 from slack_sdk import WebClient
+
+# India has been UTC+5:30 since 1945 and has no daylight saving, so a fixed offset is
+# exact. A fixed offset is used rather than zoneinfo because zoneinfo needs the tzdata
+# package on Windows, and this library runs on Windows laptops as well as in Linux
+# containers.
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+def ist_now():
+    """
+    The current time in IST, as a naive datetime.
+
+    Everything this project writes to Mongo is IST wall-clock time so the values read
+    correctly in Compass without mental arithmetic. Use this instead of datetime.now():
+    datetime.now() returns IST only because every Dockerfile sets TZ=Asia/Calcutta,
+    which quietly makes the container timezone load-bearing. This does not depend on it
+    and returns the same value on any host.
+
+    The timezone is dropped on the way out for two reasons: pymongo stores a naive
+    datetime's digits verbatim, which is what keeps Mongo readable, and the bots compare
+    these values against other naive datetimes - pandas raises a TypeError if you
+    compare timezone-aware against timezone-naive.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None) + IST_OFFSET
+
 
 def round_to_nearest(x, base=0.05):
     """
