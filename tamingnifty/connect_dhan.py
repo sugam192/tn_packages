@@ -22,6 +22,8 @@ import pyotp
 import requests
 import sys
 import time
+import math
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import timedelta
 from pymongo import MongoClient
 from retry import retry
@@ -848,10 +850,159 @@ def check_dhan_response(response):
     )
 
 
+_last_depth_request = 0.0
+
+
+def execution_number(value, name):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError("Invalid execution " + name)
+    return number
+
+
+def execution_tick(security_id, exchange_segment):
+    # Execution must not guess a tick if the master is missing.
+    exchange, segment = SEGMENT_TO_MASTER[exchange_segment]
+    master = load_instruments()
+    rows = master.loc[(master["SECURITY_ID"].astype(str) == str(security_id))
+                      & (master["EXCH_ID"] == exchange) & (master["SEGMENT"] == segment)]
+    if len(rows) != 1:
+        raise ValueError("Need one exact instrument tick before execution")
+    return execution_number(float(rows.iloc[0]["TICK_SIZE"]) / 100, "tick")
+
+
+def round_execution_price(price, tick, side):
+    execution_number(price, "price")
+    execution_number(tick, "tick")
+    if side not in ("BUY", "SELL"):
+        raise ValueError("Invalid execution side")
+    rounding = ROUND_CEILING if side == "BUY" else ROUND_FLOOR
+    result = (Decimal(str(price)) / Decimal(str(tick))).to_integral_value(rounding=rounding)
+    return float(result * Decimal(str(tick)))
+
+
+def get_depth(conn, security_id, exchange_segment):
+    global _last_depth_request
+    wait = 1 - (time.monotonic() - _last_depth_request)
+    if wait > 0:
+        time.sleep(wait)
+    _last_depth_request = time.monotonic()
+    response = requests.post(
+        f"{API_BASE}/marketfeed/quote", headers=build_headers(conn, include_client_id=True),
+        json={exchange_segment: [int(security_id)]}, timeout=3)
+    check_dhan_response(response)
+    if time.monotonic() - _last_depth_request > 3:
+        raise ValueError("Depth response too old for execution")
+    data = response.json()
+    if data.get("status") != "success":
+        raise ValueError("Dhan depth request did not succeed: " + str(data))
+    return data["data"][exchange_segment][str(security_id)]
+
+
+def depth_limit(quote, side, quantity, tick, max_price=None, entry=False):
+    if side not in ("BUY", "SELL") or int(quantity) != quantity or quantity <= 0:
+        raise ValueError("Invalid execution side/quantity")
+    bids, asks = [], []
+    for kind, levels in (("buy", bids), ("sell", asks)):
+        for row in quote["depth"][kind]:
+            qty = float(row["quantity"])
+            if not math.isfinite(qty) or qty < 0 or int(qty) != qty:
+                raise ValueError("Invalid depth quantity")
+            if qty > 0:
+                levels.append((execution_number(row["price"], "depth price"), int(qty)))
+    bids.sort(reverse=True)
+    asks.sort()
+    if not bids or not asks or bids[0][0] > asks[0][0]:
+        raise ValueError("Missing or crossed bid/ask depth")
+    midpoint = (asks[0][0] + bids[0][0]) / 2
+    if entry and (asks[0][0] - bids[0][0]) / midpoint > 0.0075:
+        raise ValueError("Entry spread exceeds 0.75%")
+    available = 0
+    levels = asks if side == "BUY" else bids
+    for price, qty in levels:
+        available += qty
+        reference = price
+        if available >= quantity:
+            break
+    if entry and available < quantity:
+        raise ValueError("Insufficient displayed depth for entry")
+    price = Decimal(str(reference)) * Decimal("1.001" if side == "BUY" else "0.999")
+    lower = execution_number(quote["lower_circuit_limit"], "lower circuit")
+    upper = execution_number(quote["upper_circuit_limit"], "upper circuit")
+    if lower > upper:
+        raise ValueError("Invalid exchange price bounds")
+    low_tick = round_execution_price(lower, tick, "BUY")
+    high_tick = round_execution_price(upper, tick, "SELL")
+    if max_price is not None:
+        high_tick = min(high_tick, round_execution_price(max_price, tick, "SELL"))
+    if low_tick > high_tick:
+        raise ValueError("No valid execution price inside bounds")
+    price = round_execution_price(price, tick, side)
+    price = max(low_tick, min(high_tick, price))
+    if entry and price < reference:
+        raise ValueError("Entry ask moved beyond fixed price cap")
+    return price, reference
+
+
+def prepare_order(conn, security_id, side, quantity, exchange_segment, product_type,
+                  entry_deadline=None, correlation_id=None):
+    tick = execution_tick(security_id, exchange_segment)
+    quote = get_depth(conn, security_id, exchange_segment)
+    entry = entry_deadline is not None
+    if entry and side != "BUY":
+        raise ValueError("Entry policy is for a long BUY only")
+    price, reference = depth_limit(quote, side, quantity, tick, entry=entry)
+    policy = dict(tick=tick)
+    if entry:
+        if not math.isfinite(float(entry_deadline)) or float(entry_deadline) <= time.time():
+            raise ValueError("Invalid or expired entry deadline")
+        policy.update(deadline=min(float(entry_deadline), time.time() + 15),
+                      max_price=round_execution_price(
+                          Decimal(str(reference)) * Decimal("1.01"), tick, "SELL"))
+        price, _ = depth_limit(quote, side, quantity, tick, policy["max_price"], entry=True)
+    body = dict(dhanClientId=conn["client_id"], transactionType=side,
+                exchangeSegment=exchange_segment, productType=product_type,
+                orderType="LIMIT", validity="DAY", securityId=str(security_id),
+                quantity=int(quantity), price=price)
+    if correlation_id is not None:
+        body["correlationId"] = correlation_id
+    return dict(request=body, policy=policy)
+
+
+def submit_prepared_order(conn, prepared):
+    policy = prepared["policy"]
+    if policy.get("deadline") is not None and time.time() >= policy["deadline"]:
+        raise ValueError("Entry expired before submission; no request sent")
+    response = requests.post(f"{API_BASE}/orders", headers=build_headers(conn),
+                             json=prepared["request"], timeout=3)
+    check_dhan_response(response)
+    return response.json()
+
+
+def order_by_correlation(conn, correlation_id):
+    response = requests.get(f"{API_BASE}/orders/external/{correlation_id}",
+                            headers=build_headers(conn), timeout=3)
+    check_dhan_response(response)
+    data = response.json()
+    if isinstance(data, list):
+        if len(data) != 1:
+            raise ValueError("Ambiguous order correlation; reconcile with Dhan")
+        data = data[0]
+    if not data.get("orderId"):
+        raise ValueError("Order correlation unresolved; do not resubmit")
+    return data
+
+
+def cancel_order(conn, order_id):
+    response = requests.delete(f"{API_BASE}/orders/{order_id}",
+                               headers=build_headers(conn), timeout=3)
+    check_dhan_response(response)
+
+
 def send_order(conn, security_id, transaction_type, quantity,
                exchange_segment, product_type):
     """
-    Place a MARKET order and return Dhan's response, which looks like:
+    Place a depth-priced LIMIT order and return Dhan's response, which looks like:
 
         {"orderId": "112111182198", "orderStatus": "PENDING"}
 
@@ -881,32 +1032,14 @@ def send_order(conn, security_id, transaction_type, quantity,
     for CRUDEOILM is 10 barrels and about Rs 87,000 of notional on Rs 27,800 of
     margin. Sending 65 there the way you would for NIFTY buys 65 lots.
     """
-    body = {
-        "dhanClientId": conn["client_id"],
-        "transactionType": transaction_type,   # "BUY" or "SELL"
-        "exchangeSegment": exchange_segment,
-        "productType": product_type,
-        "orderType": "MARKET",
-        "validity": "DAY",
-        "securityId": str(security_id),
-        "quantity": int(quantity),
-        "price": 0,
-    }
-
-    response = requests.post(
-        f"{API_BASE}/orders", headers=build_headers(conn), json=body, timeout=30
-    )
-    # A 400 here means Dhan did not like something in the body above, so print what
-    # we sent as well as what Dhan said. One of the two will name the problem.
-    if response.status_code >= 400:
-        print(f"Order Dhan rejected: {body}")
-    check_dhan_response(response)
-    return response.json()
+    prepared = prepare_order(conn, security_id, transaction_type, quantity,
+                             exchange_segment, product_type)
+    return submit_prepared_order(conn, prepared)
 
 
 def place_order(conn, security_id, transaction_type, quantity):
     """
-    Market order for an index option contract, held overnight (MARGIN).
+    Depth-priced limit for an index option contract (MARGIN).
 
     There is deliberately no @retry here, for the same reason spelled out under
     place_equity_order below: a retry only helps if the request never reached Dhan,
@@ -920,7 +1053,7 @@ def place_order(conn, security_id, transaction_type, quantity):
 
 def place_equity_order(conn, security_id, transaction_type, quantity):
     """
-    Market order for NSE cash delivery (CNC).
+    Depth-priced limit for NSE cash delivery (CNC).
 
     There is deliberately no @retry on this one. A retry can only help if the
     request never reached Dhan, and from here we cannot tell that apart from a
@@ -933,7 +1066,7 @@ def place_equity_order(conn, security_id, transaction_type, quantity):
 
 def place_commodity_order(conn, security_id, transaction_type, quantity):
     """
-    Market order for an MCX futures contract, held overnight (MARGIN).
+    Depth-priced limit for an MCX futures contract (MARGIN).
 
     quantity here is a number of LOTS, because every MCX row in the scrip master
     reads LOT_SIZE 1. That is the same rule as everywhere else - lots x LOT_SIZE -
@@ -948,19 +1081,20 @@ def place_commodity_order(conn, security_id, transaction_type, quantity):
                       "MCX_COMM", "MARGIN")
 
 
-@retry(tries=5, delay=2, backoff=2)
 def get_order(conn, order_id):
     """
     Fetch the current state of one order. The useful fields are orderStatus and
     averageTradedPrice.
     """
     response = requests.get(
-        f"{API_BASE}/orders/{order_id}", headers=build_headers(conn), timeout=30
+        f"{API_BASE}/orders/{order_id}", headers=build_headers(conn), timeout=3
     )
     check_dhan_response(response)
     data = response.json()
     # Dhan returns a single-element list for this endpoint.
     if isinstance(data, list):
+        if len(data) != 1:
+            raise ValueError("Expected one exact order from Dhan")
         return data[0]
     return data
 
@@ -1013,7 +1147,7 @@ def modify_order(conn, order_id, order_type, quantity, price=0):
     }
 
     response = requests.put(
-        f"{API_BASE}/orders/{order_id}", headers=build_headers(conn), json=body, timeout=30
+        f"{API_BASE}/orders/{order_id}", headers=build_headers(conn), json=body, timeout=3
     )
     # Same reasoning as send_order: on a 400, print what we sent as well as what Dhan
     # said, because one of the two will name the problem.
@@ -1027,8 +1161,8 @@ def note_if_market_became_limit(order):
     """
     Say so when Dhan rewrites one of our MARKET orders into a LIMIT.
 
-    send_order only ever sends MARKET, so any order that comes back as LIMIT was
-    rewritten by Dhan into a protected limit priced off the LTP at that moment.
+    Historical diagnostic for callers that submitted MARKET themselves.
+    send_order now places explicit depth-priced LIMIT orders.
     Proved on MCX on 2026-09-29: we sent MARKET, Dhan stored LIMIT at 8874.0 against
     an LTP of 8779, a band of about 1% through the market. It is undocumented.
 
@@ -1047,49 +1181,18 @@ def note_if_market_became_limit(order):
 
 
 def chase_the_order(conn, order, attempt, step):
-    """
-    Push one order that is sitting unfilled towards a fill. Called once per attempt.
-
-    It reprices, widening each time. The obvious move - asking Dhan to turn it back
-    into a MARKET order, so it redoes its own protected-limit sum at the price now
-    instead of the price when we placed it - is refused by the API; modify_order's
-    docstring has the evidence. So we work out the price ourselves.
-
-    We deliberately do NOT price at the LTP: a limit sitting exactly at the LTP only
-    joins the queue, which is the problem we are trying to solve. Priced through it,
-    the order is marketable and normally fills at the touch - better than the price
-    we offered. Repricing to the far side of the LTP is allowed: a BUY limit one
-    rupee under crude's LTP was accepted on 2026-09-29, so what bounds us is the
-    exchange's circuit band, not how close to the market we dare go.
-
-    Nothing here is direction-specific except one comparison, because an order that
-    will not fill is just as bad whichever way round it is. A buy that misses leaves
-    the credit spread short with no hedge; a sell that misses leaves the bot certain
-    it is flat when it is still holding.
-    """
-    order_id = order.get("orderId")
-    quantity = order.get("quantity")
-
-    # 0.3%, then 0.6%, then 1.2%. Widening covers a bigger move each time, and the
-    # hard stop after the last attempt matters more than the sizes do - chasing
-    # without a limit in a falling market just guarantees a sale at the bottom.
-    offset = step * (2 ** (attempt - 1))
-
-    ltp = get_ltp(conn, order.get("securityId"), order.get("exchangeSegment"))
-    if order.get("transactionType") == "BUY":
-        price = ltp * (1 + offset)
-    else:
-        price = ltp * (1 - offset)
-
-    # The tick has to come from the instrument, not the segment. MCX futures alone
-    # run from 5 paise to Rs 10 depending on the commodity, and 467 NSE cash names
-    # are coarser than 5 paise. See get_tick_size.
-    tick = get_tick_size(order.get("securityId"), order.get("exchangeSegment"))
-    price = round(round(price / tick) * tick, 2)
-
-    modify_order(conn, order_id, "LIMIT", quantity, price)
-    print(f"Order {order_id} still unfilled - repriced to {price} "
-          f"({round(offset * 100, 2)}% through an LTP of {ltp}).", flush=True)
+    """Compatibility entry point; attempt/step no longer widen LTP offsets."""
+    current = checked_order(conn, order["orderId"], order)
+    if current["orderStatus"] in FINAL_ORDER_STATUSES:
+        return current
+    tick = execution_tick(current["securityId"], current["exchangeSegment"])
+    quote = get_depth(conn, current["securityId"], current["exchangeSegment"])
+    price, _ = depth_limit(quote, current["transactionType"],
+                           current["quantity"] - current["filledQty"], tick)
+    current = checked_order(conn, order["orderId"], order)
+    if current["orderStatus"] in ("PENDING", "PART_TRADED"):
+        modify_order(conn, current["orderId"], "LIMIT", current["quantity"], price)
+    return current
 
 
 def warn_order_never_filled(order, slack_channel):
@@ -1118,80 +1221,93 @@ def warn_order_never_filled(order, slack_channel):
               f"{util.exception_detail(e)}", flush=True)
 
 
-def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
-                  slack_channel=None):
-    """
-    Poll an order until it reaches a final state, chasing the price if it will not
-    fill, and return whatever state it ended in.
-
-    Terminal states on Dhan are TRADED, REJECTED, CANCELLED and EXPIRED - note the
-    success value is TRADED, not COMPLETE as it was on Definedge.
-
-    We poll rather than assume, because a MARKET order does not necessarily behave
-    like one: Dhan rewrites it into a protected LIMIT (see note_if_market_became_limit),
-    and in a fast move that limit can be left behind by the market and never fill. So
-    after `tries` polls we chase - up to `chases` times, escalating - and only then
-    give up. Worst case is about 20 seconds, which is less than the 30 this used to
-    spend waiting passively.
-
-    A REJECTED order is returned immediately and never chased. The reason matters
-    (funds, freeze quantity, RMS) and repricing fixes none of them.
-
-    If it still has not filled we return the last state we saw rather than raising,
-    so the caller decides what to do - but warn_order_never_filled has already said
-    so on Slack by then. The caller must always check orderStatus before using
-    averageTradedPrice, and must check filledQty too: chasing makes a part fill a
-    much more likely place to end up than it used to be.
-    """
+def checked_order(conn, order_id, expected=None):
     order = get_order(conn, order_id)
-    note_if_market_became_limit(order)
-
-    # Dhan is never asked to change this. If it ever reports a different number we
-    # have misunderstood what quantity means on a modify, and the safe thing is to
-    # stop touching the order rather than risk adding to the position.
-    original_quantity = order.get("quantity")
-
-    attempt = 0
-    while attempt <= chases:
-        if attempt > 0:
-            if order.get("quantity") != original_quantity:
-                print(f"Order {order_id} quantity changed from {original_quantity} to "
-                      f"{order.get('quantity')} after a modify. Not touching it again.",
-                      flush=True)
-                break
-            chase_failed = False
-            try:
-                chase_the_order(conn, order, attempt, step)
-            except Exception as e:
-                # A chase can be refused for a reason no amount of repricing fixes.
-                # The commonest is the price landing outside the exchange's circuit
-                # limit, and that is not a rare corner: on MCX crude the lower
-                # circuit sits about 1.5% below the last price, so a sell chased
-                # 1.2% down is already close to it, and in the fast fall where this
-                # code earns its keep the price IS the circuit.
-                #
-                # Stop rather than raise. The caller needs the order back so it can
-                # see what the position really is, and warn_order_never_filled below
-                # is what is supposed to get somebody's attention - an exception
-                # thrown from here would skip it.
-                print(f"Order {order_id} could not be chased "
-                      f"({util.exception_detail(e)}). Giving up on it.", flush=True)
-                chase_failed = True
-            if chase_failed:
-                break
-
-        # Check what we already have before asking again - the order we fetched a
-        # moment ago is usually already TRADED, and re-fetching it first would spend
-        # an extra round trip on every single order we ever place.
-        count = 0
-        while count < tries:
-            if order.get("orderStatus") in FINAL_ORDER_STATUSES:
-                return order
-            time.sleep(delay)
-            order = get_order(conn, order_id)
-            count = count + 1
-
-        attempt = attempt + 1
-
-    warn_order_never_filled(order, slack_channel)
+    if str(order.get("orderId")) != str(order_id):
+        raise ValueError("Dhan returned a different order; reconcile before continuing")
+    quantity = order.get("quantity")
+    filled = order.get("filledQty")
+    if (not isinstance(quantity, int) or quantity <= 0 or not isinstance(filled, int)
+            or not 0 <= filled <= quantity):
+        raise ValueError("Invalid broker order quantities")
+    if order.get("transactionType") not in ("BUY", "SELL"):
+        raise ValueError("Invalid broker order side")
+    if order.get("orderStatus") not in FINAL_ORDER_STATUSES + ("TRANSIT", "PENDING", "PART_TRADED"):
+        raise ValueError("Unknown broker order state")
+    if expected is not None:
+        for field in ("quantity", "transactionType", "securityId", "exchangeSegment"):
+            if str(order.get(field)) != str(expected.get(field)):
+                raise ValueError("Broker order identity changed: " + field)
+        if filled < expected.get("filledQty", 0):
+            raise ValueError("Broker filled quantity decreased; reconcile before continuing")
+    if order["orderStatus"] == "TRADED" and filled != quantity:
+        raise ValueError("TRADED order is not fully filled")
+    if filled > 0:
+        execution_number(order["averageTradedPrice"], "average fill price")
     return order
+
+
+def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
+                  slack_channel=None, prepared=None):
+    """Monitor/reprice the same order for ten seconds; never replace it.
+
+    Legacy arguments remain accepted for callers, but execution cadence is now two
+    seconds and depth cushion is 0.1%. An explicit long-entry policy cancels at its
+    persisted deadline; generic BUY orders may close shorts, so are not cancelled.
+    A nonterminal return is NOT a fill and leaves ownership with the caller.
+    """
+    if (tries, delay, chases, step) != (5, 1, 3, 0.003):
+        print("Legacy fill timing/offset arguments replaced by two-second depth monitoring.",
+              flush=True)
+    order = checked_order(conn, order_id)
+    expected = prepared["request"].copy() if prepared is not None else order.copy()
+    policy = prepared["policy"] if prepared is not None else {}
+    for field in ("quantity", "transactionType", "securityId", "exchangeSegment"):
+        if str(order.get(field)) != str(expected.get(field)):
+            raise ValueError("Unexpected broker order " + field)
+    until = time.monotonic() + 10
+    cancel_sent = False
+    while True:
+        expected["filledQty"] = order["filledQty"]
+        if order["orderStatus"] in FINAL_ORDER_STATUSES:
+            return order
+        expired = policy.get("deadline") is not None and time.time() >= policy["deadline"]
+        if expired and not cancel_sent:
+            cancel_order(conn, order_id)
+            cancel_sent = True
+        if time.monotonic() >= until:
+            warn_order_never_filled(order, slack_channel)
+            return order
+        if not expired and not cancel_sent and order["orderStatus"] in ("PENDING", "PART_TRADED"):
+            tick = policy.get("tick")
+            if tick is None:
+                tick = execution_tick(order["securityId"], order["exchangeSegment"])
+            remaining = order["quantity"] - order["filledQty"]
+            if remaining <= 0:
+                raise ValueError("Nonterminal order has no remaining quantity")
+            try:
+                quote = get_depth(conn, order["securityId"], order["exchangeSegment"])
+                price, _ = depth_limit(quote, order["transactionType"], remaining, tick,
+                                       policy.get("max_price"),
+                                       entry=policy.get("deadline") is not None)
+            except ValueError as error:
+                if policy.get("deadline") is None:
+                    raise
+                print(f"Entry {order_id} cancelled: {error}", flush=True)
+                cancel_order(conn, order_id)
+                cancel_sent = True
+                order = checked_order(conn, order_id, expected)
+                expected["filledQty"] = order["filledQty"]
+                continue
+            # Quotes take time; recheck status and deadline before modifying.
+            order = checked_order(conn, order_id, expected)
+            expected["filledQty"] = order["filledQty"]
+            if order["orderStatus"] in FINAL_ORDER_STATUSES:
+                continue
+            if policy.get("deadline") is not None and time.time() >= policy["deadline"]:
+                continue
+            if (order["orderStatus"] in ("PENDING", "PART_TRADED")
+                    and float(order["price"]) != price):
+                modify_order(conn, order_id, "LIMIT", order["quantity"], price)
+        time.sleep(2)
+        order = checked_order(conn, order_id, expected)

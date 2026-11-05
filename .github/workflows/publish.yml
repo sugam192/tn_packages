@@ -82,5 +82,8 @@ jobs:
           python -c "from tamingnifty import connect_definedge; print('connect_definedge OK')"
           python -c "from tamingnifty import tick_streamer;     print('tick_streamer OK')"
 
+      - name: Verify offline order execution
+        run: python test_execution.py
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
