@@ -396,7 +396,7 @@ def test_deadline_is_rechecked_after_quote_before_modify():
     modify.assert_not_called()
 
 
-def test_swing_main_uses_interceptor_trades_and_existing_order_state():
+def test_swing_main_uses_interceptor_trades_and_orders_with_existing_signal():
     client = MagicMock()
     strategies = Mock()
     strategies.count_documents.return_value = 0
@@ -413,7 +413,7 @@ def test_swing_main_uses_interceptor_trades_and_existing_order_state():
             patch.dict(swing.os.environ, {"quantity": "65"}):
         swing.main()
     names = [call.args[0] for call in database.__getitem__.call_args_list]
-    assert names == ["nifty_interceptor_test", "orders_nifty_swing_test", "supertrend"]
+    assert names == ["nifty_interceptor_test", "orders_nifty_interceptor_test", "supertrend"]
     client.close.assert_called_once()
 
 
