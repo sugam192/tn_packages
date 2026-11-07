@@ -3,7 +3,7 @@ import sys
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pandas as pd
 
@@ -396,11 +396,32 @@ def test_deadline_is_rechecked_after_quote_before_modify():
     modify.assert_not_called()
 
 
+def test_swing_main_uses_interceptor_trades_and_existing_order_state():
+    client = MagicMock()
+    strategies = Mock()
+    strategies.count_documents.return_value = 0
+    strategies.find_one.return_value = None
+    database = client["Bots"]
+    database.__getitem__.side_effect = lambda name: strategies if name == "nifty_interceptor_test" else Mock()
+    config = dict(user="test", mongo="offline", slack="offline", simulated=True)
+    with patch.object(swing, "load_dotenv"), patch.object(swing, "find_dotenv", return_value=""), \
+            patch.object(swing, "settings", return_value=config), \
+            patch.object(swing, "MongoClient", return_value=client), \
+            patch.object(swing, "WebClient"), patch.object(swing, "notify"), \
+            patch.object(swing.util, "get_public_ip", return_value="offline"), \
+            patch.object(swing, "now_ist", return_value=datetime(2026, 11, 7, 15, 16)), \
+            patch.dict(swing.os.environ, {"quantity": "65"}):
+        swing.main()
+    names = [call.args[0] for call in database.__getitem__.call_args_list]
+    assert names == ["nifty_interceptor_test", "orders_nifty_swing_test", "supertrend"]
+    client.close.assert_called_once()
+
+
 if __name__ == "__main__":
     include_swing = "--swing" in sys.argv
     if include_swing:
         spec = importlib.util.spec_from_file_location(
-            "swing_executor", ROOT.parent / "nifty-swing-option-buy" / "OptionBuy" / "option_buy.py")
+            "swing_executor", ROOT.parent / "nifty-interceptor" / "executor" / "executor.py")
         swing = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(swing)
     tests = [value for name, value in list(globals().items())
