@@ -12,6 +12,22 @@ def test_options_four_executed_orders():
                           gst=16.60, dp=0.0, total=136.88), charges
 
 
+def test_bse_options_preserve_nse_default_and_charge_eight_orders():
+    nse = order_charges("options", "SELL", 1000, 20)
+    bse = order_charges("options", "SELL", 1000, 20, exchange="BSE")
+    assert nse["exchange_txn"] == 7.11
+    assert bse["exchange_txn"] == 6.50
+    assert bse["stt"] == 30
+    assert bse["total"] == 61.29, bse
+    assert sum_charges(*[bse] * 8)["brokerage"] == 160
+    for exchange in ("MCX", "unknown"):
+        try:
+            order_charges("options", "BUY", 100, 20, exchange=exchange)
+        except ValueError:
+            continue
+        raise AssertionError("Unsupported exchange accepted")
+
+
 def test_futures_notional_and_sides():
     buy = order_charges("futures", "BUY", 24000, 65)
     sell = order_charges("futures", "SELL", 25000, 65)

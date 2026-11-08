@@ -21,20 +21,22 @@ def money(value, whole_rupees=False):
     return float(Decimal(str(value)).quantize(Decimal(unit), rounding=ROUND_HALF_UP))
 
 
-def order_charges(segment, side, price, quantity):
-    """One executed NSE order; price is premium for options, not index notional."""
+def order_charges(segment, side, price, quantity, exchange="NSE"):
+    """One executed order; price is premium for options, not index notional."""
     price = float(price)
     qty = int(quantity)
     if not isfinite(price) or price < 0 or qty <= 0 or qty != float(quantity):
         raise ValueError("Charges require a finite non-negative price and positive whole quantity")
     if side not in ("BUY", "SELL"):
         raise ValueError("Charge side must be BUY or SELL")
+    if exchange not in ("NSE", "BSE") or (exchange == "BSE" and segment != "options"):
+        raise ValueError("Supported charge venues are NSE and BSE options")
     turnover = Decimal(str(price)) * qty
     if segment == "options":
         brokerage = 20.0
         stt_rate = "0.0015" if side == "SELL" else "0"
         stamp_rate = "0.00003"
-        exchange_rate = "0.000355299"
+        exchange_rate = "0.000325" if exchange == "BSE" else "0.000355299"
     elif segment == "futures":
         brokerage = min(Decimal("20"), turnover * Decimal("0.0003"))
         stt_rate = "0.0005" if side == "SELL" else "0"
@@ -56,8 +58,10 @@ def order_charges(segment, side, price, quantity):
         "ipft": money(turnover * Decimal("0.000000001")),
         "dp": ETF_DP_FEE if segment.startswith("etf_") and side == "SELL" else 0.0,
     }
-    # The supplied chart excludes IPFT from its GST base.
+    # The supplied NSE chart excludes IPFT from its GST base.
     gst_base = sum(Decimal(str(charges[field])) for field in ("brokerage", "exchange_txn", "sebi"))
+    if exchange == "BSE":
+        gst_base += Decimal(str(charges["ipft"]))
     if segment.startswith("etf_"):
         gst_base += Decimal(str(charges["ipft"])) + Decimal(str(charges["dp"]))
     charges["gst"] = money(Decimal("0.18") * gst_base)
