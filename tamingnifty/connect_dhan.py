@@ -899,7 +899,8 @@ def get_depth(conn, security_id, exchange_segment):
     return data["data"][exchange_segment][str(security_id)]
 
 
-def depth_limit(quote, side, quantity, tick, max_price=None, entry=False):
+def depth_limit(quote, side, quantity, tick, max_price=None, entry=False,
+                best_price_only=False):
     if side not in ("BUY", "SELL") or int(quantity) != quantity or quantity <= 0:
         raise ValueError("Invalid execution side/quantity")
     bids, asks = [], []
@@ -926,7 +927,11 @@ def depth_limit(quote, side, quantity, tick, max_price=None, entry=False):
             break
     if entry and available < quantity:
         raise ValueError("Insufficient displayed depth for entry")
-    price = Decimal(str(reference)) * Decimal("1.001" if side == "BUY" else "0.999")
+    if best_price_only:
+        reference = levels[0][0]
+        price = Decimal(str(reference))
+    else:
+        price = Decimal(str(reference)) * Decimal("1.001" if side == "BUY" else "0.999")
     lower = execution_number(quote["lower_circuit_limit"], "lower circuit")
     upper = execution_number(quote["upper_circuit_limit"], "upper circuit")
     if lower > upper:
@@ -945,9 +950,10 @@ def depth_limit(quote, side, quantity, tick, max_price=None, entry=False):
 
 
 def prepare_order(conn, security_id, side, quantity, exchange_segment, product_type,
-                  entry_deadline=None, correlation_id=None):
+                  entry_deadline=None, correlation_id=None, best_price_first=False):
     tick = execution_tick(security_id, exchange_segment)
     quote = get_depth(conn, security_id, exchange_segment)
+    received_at = time.time() if best_price_first else None
     entry = entry_deadline is not None
     if entry and side != "BUY":
         raise ValueError("Entry policy is for a long BUY only")
@@ -960,13 +966,23 @@ def prepare_order(conn, security_id, side, quantity, exchange_segment, product_t
                       max_price=round_execution_price(
                           Decimal(str(reference)) * Decimal("1.01"), tick, "SELL"))
         price, _ = depth_limit(quote, side, quantity, tick, policy["max_price"], entry=True)
+    if best_price_first:
+        price, reference = depth_limit(quote, side, quantity, tick,
+                                       policy.get("max_price"), entry=entry,
+                                       best_price_only=True)
+        policy["best_price_first"] = True
     body = dict(dhanClientId=conn["client_id"], transactionType=side,
                 exchangeSegment=exchange_segment, productType=product_type,
                 orderType="LIMIT", validity="DAY", securityId=str(security_id),
                 quantity=int(quantity), price=price)
     if correlation_id is not None:
         body["correlationId"] = correlation_id
-    return dict(request=body, policy=policy)
+    prepared = dict(request=body, policy=policy)
+    if best_price_first:
+        prepared["initial_quote"] = dict(received_at=received_at, quote=quote,
+                                         remaining_quantity=int(quantity),
+                                         reference=reference, limit_price=price)
+    return prepared
 
 
 def submit_prepared_order(conn, prepared):
@@ -1247,8 +1263,15 @@ def checked_order(conn, order_id, expected=None):
     return order
 
 
+def save_execution_quote(collection, key, snapshot):
+    if collection is not None:
+        result = collection.insert_one(dict(order_key=key, **snapshot))
+        if not result.acknowledged:
+            raise RuntimeError("Execution quote was not saved; refusing to reprice " + str(key))
+
+
 def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
-                  slack_channel=None, prepared=None):
+                  slack_channel=None, prepared=None, audit_collection=None, audit_id=None):
     """Monitor/reprice the same order for ten seconds; never replace it.
 
     Legacy arguments remain accepted for callers, but execution cadence is now two
@@ -1259,6 +1282,8 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
     if (tries, delay, chases, step) != (5, 1, 3, 0.003):
         print("Legacy fill timing/offset arguments replaced by two-second depth monitoring.",
               flush=True)
+    if (audit_collection is None) != (audit_id is None):
+        raise ValueError("Execution audit needs both a collection and an order key")
     order = checked_order(conn, order_id)
     expected = prepared["request"].copy() if prepared is not None else order.copy()
     policy = prepared["policy"] if prepared is not None else {}
@@ -1267,6 +1292,13 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
             raise ValueError("Unexpected broker order " + field)
     until = time.monotonic() + 10
     cancel_sent = False
+    if policy.get("best_price_first") and order["orderStatus"] not in FINAL_ORDER_STATUSES:
+        # Give the initial best bid/ask a chance before crossing deeper into the book.
+        wait = 3
+        if policy.get("deadline") is not None:
+            wait = min(wait, max(0, policy["deadline"] - time.time()))
+        time.sleep(wait)
+        order = checked_order(conn, order_id, expected)
     while True:
         expected["filledQty"] = order["filledQty"]
         if order["orderStatus"] in FINAL_ORDER_STATUSES:
@@ -1285,12 +1317,19 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
             remaining = order["quantity"] - order["filledQty"]
             if remaining <= 0:
                 raise ValueError("Nonterminal order has no remaining quantity")
+            snapshot = dict(remaining_quantity=remaining, order_price_before=order["price"],
+                            filled_quantity=order["filledQty"], order_id=str(order_id))
             try:
                 quote = get_depth(conn, order["securityId"], order["exchangeSegment"])
-                price, _ = depth_limit(quote, order["transactionType"], remaining, tick,
+                snapshot["quote"] = quote
+                if audit_collection is not None:
+                    snapshot["received_at"] = time.time()
+                price, reference = depth_limit(quote, order["transactionType"], remaining, tick,
                                        policy.get("max_price"),
                                        entry=policy.get("deadline") is not None)
             except ValueError as error:
+                snapshot["error"] = str(error)
+                save_execution_quote(audit_collection, audit_id, snapshot)
                 if policy.get("deadline") is None:
                     raise
                 print(f"Entry {order_id} cancelled: {error}", flush=True)
@@ -1299,6 +1338,8 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
                 order = checked_order(conn, order_id, expected)
                 expected["filledQty"] = order["filledQty"]
                 continue
+            snapshot.update(reference=reference, limit_price=price)
+            save_execution_quote(audit_collection, audit_id, snapshot)
             # Quotes take time; recheck status and deadline before modifying.
             order = checked_order(conn, order_id, expected)
             expected["filledQty"] = order["filledQty"]

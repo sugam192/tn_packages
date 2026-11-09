@@ -39,6 +39,36 @@ MIT
 
 ## Depth-based Dhan execution (2.4.0)
 
+### Opt-in best-price-first and quote audit (2.4.2)
+
+`prepare_order(..., best_price_first=True)` starts BUY at the best ask and
+SELL at the best bid, without the depth cushion. Existing entry spread,
+displayed-size, fixed price-cap and deadline checks still apply. Persist the
+whole returned object before submission: `initial_quote` contains the full
+broker quote (all returned bids/asks and quantities), receipt time, selected
+reference, requested quantity and limit price.
+
+`wait_for_fill` gives that order up to three seconds before depth repricing,
+limited by an entry deadline. A remaining quantity then uses the existing
+depth-priced, 0.1%-cushioned policy; it modifies the same total-quantity order,
+never submits another one. BUY entry caps/deadlines remain in force; SELL has
+no fixed floor and still prioritizes closure over a bounded price.
+
+Pass `audit_collection` and `audit_id` together to `wait_for_fill` to insert
+each subsequent full quote and pricing evaluation as a separate audit document
+before any modification. Records include `order_key`, broker `order_id`, receipt time,
+remaining/filled quantity, previous order price and candidate reference/limit,
+or the validation error. This avoids unbounded arrays inside an order document.
+A candidate may be unused if a fill races the quote.
+Audit-write failures stop repricing and surface to the caller; the existing
+order can remain working. Broker fetch failures cannot supply a depth
+snapshot and still surface explicitly. REST provides only its returned
+depth levels, not the entire exchange order book or proof of source freshness.
+
+Only opted-in consumers use best-price-first. Existing generic callers keep
+their execution behavior. Neither this policy nor a lower sell limit guarantees
+a fill, a better fill or a bounded loss.
+
 All Dhan order wrappers now submit explicit LIMIT orders from current bid/ask
 depth, not MARKET orders subject to broker conversion. BUY uses asks; SELL uses
 bids. Prices include a 0.1% cushion, rounded outward with Decimal to the exact
