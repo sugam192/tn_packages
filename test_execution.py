@@ -507,6 +507,48 @@ def test_swing_unacknowledged_intent_never_submits():
     submit.assert_not_called()
 
 
+def test_swing_buy_and_sell_use_intraday_product_with_limit_depth_policy():
+    now = datetime(2026, 11, 9, 10)
+    for side in ("BUY", "SELL"):
+        orders, docs = collection()
+        key = "trade:" + side
+
+        def submit(conn, plan):
+            request = plan["request"]
+            assert request["productType"] == "INTRADAY"
+            assert request["orderType"] == "LIMIT"
+            assert request["transactionType"] == side
+            assert plan["policy"]["best_price_first"] is True
+            assert plan["initial_quote"]["quote"] == quote()
+            assert docs[key]["prepared"] == plan
+            return dict(orderId="123")
+
+        with patch.object(swing, "now_ist", return_value=now), \
+                patch.object(dhan, "execution_tick", return_value=0.05), \
+                patch.object(dhan, "get_depth", return_value=quote()), \
+                patch.object(dhan.time, "time", return_value=1000), \
+                patch.object(dhan, "submit_prepared_order", side_effect=submit), \
+                patch.object(dhan, "wait_for_fill",
+                             return_value=dict(order("TRADED", 65, side),
+                                               productType="INTRADAY")):
+            result = swing.live_order({"client_id": "test"}, orders, key,
+                                      dict(security_id="101", symbol="TEST"),
+                                      65, side, now, None)
+        assert result["productType"] == "INTRADAY"
+
+
+def test_swing_paper_buy_and_sell_record_intraday_product():
+    now = datetime(2026, 11, 9, 10)
+    for side in ("BUY", "SELL"):
+        orders, _ = collection()
+        with patch.object(swing, "now_ist", return_value=now), \
+                patch.object(dhan, "get_option_ltp", return_value=100):
+            result = swing.execute_order({}, orders, "trade:" + side,
+                                         dict(security_id="101", symbol="TEST"),
+                                         65, side, now, True)
+        assert result["productType"] == "INTRADAY"
+
+
 def test_swing_unresolved_submit_never_replaces_order():
     stored = dict(_id="trade:BUY", simulated=False, prepared=prepared(1010),
                   correlationId="intent")
