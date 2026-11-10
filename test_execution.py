@@ -688,6 +688,7 @@ def test_swing_main_uses_interceptor_trades_and_orders_with_existing_signal():
             patch.object(swing, "settings", return_value=config), \
             patch.object(swing, "MongoClient", return_value=client), \
             patch.object(swing, "WebClient"), patch.object(swing, "notify"), \
+            patch.object(swing, "check_trading_day", return_value=True), \
             patch.object(swing.util, "get_public_ip", return_value="offline"), \
             patch.object(swing, "now_ist", return_value=datetime(2026, 11, 7, 15, 16)), \
             patch.dict(swing.os.environ, {"quantity": "65"}):

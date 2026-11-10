@@ -1,0 +1,32 @@
+{
+  "_id": "NSE:2026",
+  "exchange": "NSE",
+  "year": 2026,
+  "status": "verified",
+  "valid_from": "2026-01-01",
+  "valid_to": "2026-12-31",
+  "verified_at": "2026-11-10",
+  "sources": [
+    "https://groww.in/p/nse-holidays",
+    "https://www.angelone.in/nse-holidays"
+  ],
+  "verification_note": "All16 weekday closures cross-checked against both broker calendars. Official NSE circular fetch timed out. Regular jobs skip all weekends including November8 Muhurat; this is not an MCX/currency/settlement calendar. Review ad-hoc exchange changes and install next year's verified calendar before January1.",
+  "holidays": [
+    {"date": "2026-01-15", "name": "Maharashtra municipal corporation election"},
+    {"date": "2026-01-26", "name": "Republic Day"},
+    {"date": "2026-03-03", "name": "Holi"},
+    {"date": "2026-03-26", "name": "Shri Ram Navami"},
+    {"date": "2026-03-31", "name": "Shri Mahavir Jayanti"},
+    {"date": "2026-04-03", "name": "Good Friday"},
+    {"date": "2026-04-14", "name": "Dr. Baba Saheb Ambedkar Jayanti"},
+    {"date": "2026-05-01", "name": "Maharashtra Day"},
+    {"date": "2026-05-28", "name": "Bakri Id"},
+    {"date": "2026-06-26", "name": "Muharram"},
+    {"date": "2026-09-14", "name": "Ganesh Chaturthi"},
+    {"date": "2026-10-02", "name": "Mahatma Gandhi Jayanti"},
+    {"date": "2026-10-20", "name": "Dussehra"},
+    {"date": "2026-11-10", "name": "Diwali-Balipratipada"},
+    {"date": "2026-11-24", "name": "Prakash Gurpurb Sri Guru Nanak Dev"},
+    {"date": "2026-12-25", "name": "Christmas"}
+  ]
+}

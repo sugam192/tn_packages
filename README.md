@@ -37,6 +37,52 @@ Run `python test_charges.py` to verify rates, tax sides and rounding.
 
 MIT
 
+## Shared trading safety (2.4.3)
+
+All NSE bot jobs call `safety.check_trading_day(client, notify)` before broker
+login, data requests, state writes or polling. It reads `Bots.exchange_calendars`
+with `_id=NSE:<IST year>`. Weekends and listed holidays exit normally, including
+weekend Muhurat sessions (these jobs are for regular sessions only).
+Missing, invalid, unverified or unavailable calendars alert and raise: no trading.
+This is the NSE equity/F&O calendar, not an MCX/currency/settlement calendar.
+
+The reviewed `nse_calendar_2026.json` includes 16 weekday closures, cross-checked
+against the linked Groww and Angel One calendars. Direct NSE circular retrieval
+timed out; the snapshot records that limitation. Review official ad-hoc notices,
+amend the JSON and re-seed as needed. A fresh verified annual calendar is required
+before January 1; there is deliberately no next-year fallback.
+
+From this repository, preview without connecting to Mongo:
+
+```powershell
+python seed_exchange_calendar.py nse_calendar_2026.json --env-file <bot-env-file>
+```
+
+After review, add `--apply` to replace this single year document using
+`CONNECTION_STRING`. The script validates full-year coverage, requires an
+acknowledged write and checks exact read-back. Do not put credentials in the JSON.
+
+For executors without their own durable intent recovery, use
+`safety.assert_execution_clear(client, scope, notify)` outside startup polling
+catches, then wrap the entire order-and-persistence operation with
+`safety.guarded_execution(client, scope, notify, action, function, *args)`.
+Use one stable scope per strategy/account. It atomically reserves a unique
+`Bots.execution_guards` document before submission, requires acknowledged
+completion, and exits nonzero on any operation exception or SystemExit.
+Failed or crash-pending attempts block restarts and concurrent execution.
+This prevents blind retries; it does not roll back orders, flatten positions,
+guarantee alert delivery or replace broker reconciliation.
+
+Never auto-expire/delete a guard. On an alert, inspect broker order IDs,
+working/partial fills, actual positions and Mongo order/trade records. Cancel or
+manage outstanding orders/positions and repair accounting first. Only after
+manual reconciliation may an operator change that exact guard's `status` to
+`complete`, retaining its attempt/error fields and recording the reconciliation.
+The next operation gets a new attempt ID. Interceptor retains its existing
+persisted-intent recovery rather than an incompatible blanket latch.
+
+Offline checks: `python -m pytest test_safety.py -q`.
+
 ## Depth-based Dhan execution (2.4.0)
 
 ### Opt-in best-price-first and quote audit (2.4.2)
