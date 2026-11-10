@@ -1,25 +1,128 @@
-# @TamingNifty
+# TamingNifty
 
-A Python library for Definedge trading strategies.
+A Python library for percentage Renko and Point & Figure (P&F) charts,
+technical indicators, Dhan execution, optional Definedge integration and
+trading infrastructure.
+
+**Public documentation:** [PyPI project page](https://pypi.org/project/tamingnifty/).
+The published page contains this guide **and the complete API reference below
+it**, including broker, utility, charge and safety functions. In a source
+checkout, the reference is also stored as `API_REFERENCE.md`.
+Version 2.4.4 changes documentation, packaging metadata and documentation tests
+only; chart and trading algorithms are unchanged.
 
 ## Installation
 
 ```bash
-pip install tamingnifty
+python -m pip install tamingnifty
 ```
 
-## Usage
+Python 3.11 is used by the release checks. Metadata permits Python 3.7+, but
+compatibility with every currently resolved dependency on older Python versions
+is not verified. Definedge-only modules additionally require:
+
+```bash
+python -m pip install "tamingnifty[definedge]"
+```
+
+## Start here: convert your own candles without a broker
+
+The two offline conversion functions need no account, token, MongoDB, Slack
+connection or network request:
+
+- `ta.convert_to_renko(brick_size=..., df=...)`: one row per Renko brick,
+  **including an initial zero-height seed row**.
+- `ta.convert_to_pnf(brick_size=..., df=...)`: one row per P&F column,
+  including the final developing column and eight pattern flags.
+
+### Runnable Renko and P&F example
+
+These are synthetic prices, not a backtest or a trading recommendation.
+`brick_size=1` means **1%**, not one rupee. For 0.1%, pass `0.1`, not `0.001`.
+Both algorithms use successive **close prices**, with the first open as the
+anchor; they do not reconstruct an intrabar high/low path.
 
 ```python
+import pandas as pd
 from tamingnifty import ta
+
+candles = pd.DataFrame({
+    "datetime": pd.date_range("2026-01-05 09:15", periods=7, freq="min"),
+    "open": [100, 100, 102, 105, 101, 97, 100],
+    "close": [100, 102, 105, 101, 97, 100, 104],
+})
+candles = candles.sort_values("datetime").reset_index(drop=True)
+
+renko = ta.convert_to_renko(brick_size=1, df=candles.copy())
+print("Renko: last three rows")
+print(renko.tail(3)[["datetime", "low", "high", "color", "close"]].to_string(index=False))
+
+pnf = ta.convert_to_pnf(brick_size=1, df=candles.copy())
+print("P&F: all columns")
+print(pnf[["datetime", "color", "low", "high", "count", "close"]].to_string(index=False))
 ```
 
-## Features
+Expected output:
 
-- Connect to Definedge API
-- Utilities for trading strategies
-- Conversion to Renko or Point and Figure charts
-- Tick streaming
+```text
+Renko: last three rows
+           datetime    low   high color  close
+2026-01-05 09:21:00 100.00 101.00 green 101.00
+2026-01-05 09:21:00 101.00 102.01 green 102.01
+2026-01-05 09:21:00 102.01 103.03 green 103.03
+P&F: all columns
+           datetime color    low   high  count  close
+2026-01-05 09:17:00 green 100.00 104.06      4 104.06
+2026-01-05 09:19:00   red  97.06 103.03      7  97.06
+2026-01-05 09:21:00 green  98.03 103.03      6 103.03
+```
+
+### Inputs, outputs and interpretation
+
+| Detail | Renko | P&F |
+|---|---|---|
+| Required input columns | `datetime`, `close`; first `open` is used when present, otherwise first `close` | `datetime`, `open`, `close` |
+| Box size | Percentage, compounded from the previous box boundary | Same percentage stepping; hard-coded three-box reversal |
+| Output columns | `datetime`, `low`, `high`, `color`, `close` | Those columns plus `count` and eight boolean pattern columns |
+| Direction | `green` up, `red` down | `green` X column, `red` O column; a flat seed can have an empty color |
+| Final state | Includes its seed row; no separate partial-brick row | Includes the current developing column, not just completed columns |
+| `close` | Up brick's high or down brick's low | Up column's high or down column's low |
+| Timestamp | Source candle that produced the brick; several bricks can share one timestamp | Updated when a column extends; do not treat it as an immutable column-open time |
+
+P&F pattern columns are `double_top_buy`, `double_bottom_sell`, `bull_trap`,
+`bear_trap`, `high_pole`, `low_pole`, `bullish_turtle`, `bearish_turtle`.
+They are algorithmic flags, not independently validated trading signals.
+Pole flags are attached to a previous column after a later retracement, so
+their row timestamps alone do not prove when a signal became available.
+
+### Important chart limitations
+
+- Pass a **non-empty**, chronologically sorted DataFrame with finite positive
+  prices and consistent timestamp conventions. The converters do not sort,
+  deduplicate or fully validate inputs. Pass a copy: datetime conversion and
+  P&F's low-price scaling modify the supplied frame.
+- Percentage steps are rounded to two decimals. They are not fixed-point
+  bricks, an ATR size, exchange tick rounding or a promise to match another
+  charting platform's anchoring/rounding.
+- Choose a positive size that produces **nonzero rounded up/down steps at
+  every price reached**. Zero/negative sizes, tiny sizes or very low prices
+  can produce zero-progress loops; these inputs are not guarded internally.
+  P&F's internal 10x scaling when any close is below 10 reduces some rounding
+  effects but does not make all low-price inputs safe.
+- Neither converter filters incomplete source candles or proves data freshness.
+  Several synthetic bricks from one candle do not reveal their actual intrabar
+  times or executable fill prices.
+- A P&F column may change as more data arrives. Recompute prefixes or retain
+  signal-availability timestamps for causal research; do not backtest final
+  column/pattern labels as though all were known at the start of the column.
+- Use the pure `convert_to_*` functions for CSV/DataFrame input. The separate
+  `renko(...)` and `pnf(...)` functions **fetch index data through Dhan** first;
+  they require a configured connection and are not the offline examples above.
+
+Other chart helpers include Heiken Ashi conversion, ATR, Supertrend, moving
+averages, RSI, relative strength and P&F pattern/XO-zone calculations. Exact
+signatures, return shapes and implementation-specific caveats are in the API
+reference appended to the public PyPI description.
 
 ## Charge accounting (2.3.2)
 
@@ -163,8 +266,9 @@ python test_execution.py --swing
 python test_charges.py
 ```
 
-`--swing` additionally loads the sibling swing executor for integration checks.
+`--swing` additionally loads the sibling Interceptor executor for integration checks.
 The publish workflow runs library-only checks, so it needs no sibling checkout.
-Publish version 2.4.0 before building consumers pinned to it; changing source or
-requirements does not update already deployed images. Definedge 1.x consumers
-are not migrated by this release.
+Publication is triggered by a matching version tag. Changing source or
+requirements does not update already deployed images. Documentation-only
+version 2.4.4 does not require existing consumers pinned to 2.4.3 to redeploy.
+Definedge 1.x consumers are not automatically migrated by a library release.

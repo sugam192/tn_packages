@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "tamingnifty"
 # This is the ONLY place the version lives. The publish workflow checks that the
 # git tag you push matches this number.
-version = "2.4.3"
+version = "2.4.4"
 description = "A library for converting OHLC to Noiseless Charts (Renko and PNF)"
 authors = [{ name="Sugam Gupta", email="sugam192@gmail.com" }]
-readme = "README.md"
+dynamic = ["readme"]
 license = { file="LICENSE" }
 requires-python = ">=3.7"
 dependencies = [
@@ -44,3 +44,6 @@ definedge = ["pyintegrate"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["tamingnifty*"]
+
+[tool.setuptools.dynamic]
+readme = {file = ["README.md", "API_REFERENCE.md"], content-type = "text/markdown"}

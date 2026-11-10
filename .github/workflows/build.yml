@@ -63,3 +63,6 @@ jobs:
 
       - name: Verify calendar and execution fail-stop
         run: python -m pytest test_safety.py -q
+
+      - name: Verify public documentation and chart examples
+        run: python -m pytest test_documentation.py -q
