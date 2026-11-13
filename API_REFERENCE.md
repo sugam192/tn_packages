@@ -1187,6 +1187,19 @@ breakdown; no mutation/network calls. Missing component keys raise KeyError.
 It sums the fields, not the supplied `total` values, so does not validate an
 inconsistent input total.
 
+### charges.silver_micro_estimated_order_charges
+
+`silver_micro_estimated_order_charges(side, price, quantity)`
+
+Estimates one Silver Micro execution using the research scenario: Rs20
+brokerage, sell-side 0.01% CTT, buy-side 0.002% stamp, 0.0026% exchange
+fee, 0.0001% SEBI, a 0.0000001% IPFT proxy and 18% GST on brokerage,
+exchange, SEBI and IPFT. `quantity` is a whole number of Silver Micro lots;
+the scenario uses one kg per lot. `stt` stores commodity transaction tax.
+This is not a verified Dhan tariff or contract-note calculation. Settlement,
+financing and slippage are not included. Other instruments and charge
+schedules must not be estimated with this function.
+
 ### charges.option_spread_charges
 
 `option_spread_charges(quantity, long_entry, long_exit, short_entry, short_exit)`

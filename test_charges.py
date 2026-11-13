@@ -2,7 +2,8 @@
 import math
 
 from tamingnifty.charges import (etf_order_charges, etf_tax_segment, money,
-                                option_spread_charges, order_charges, sum_charges)
+                                option_spread_charges, order_charges,
+                                silver_micro_estimated_order_charges, sum_charges)
 
 
 def test_options_four_executed_orders():
@@ -36,6 +37,24 @@ def test_futures_notional_and_sides():
     assert buy["total"] == 90.13, buy
     assert sell["total"] == 873.62, sell
     assert sum_charges(buy, sell)["total"] == 963.75
+
+
+def test_silver_micro_estimated_charges_both_sides():
+    buy = silver_micro_estimated_order_charges("BUY", 100000, 1)
+    sell = silver_micro_estimated_order_charges("SELL", 100000, 1)
+    assert buy == dict(brokerage=20.0, stt=0.0, stamp_duty=2.0, exchange_txn=2.6,
+                       sebi=0.1, ipft=0.0, dp=0.0, gst=4.09, total=28.79), buy
+    assert sell == dict(brokerage=20.0, stt=10.0, stamp_duty=0.0, exchange_txn=2.6,
+                        sebi=0.1, ipft=0.0, dp=0.0, gst=4.09, total=36.79), sell
+    assert sum_charges(buy, sell)["total"] == 65.58
+    assert silver_micro_estimated_order_charges("SELL", 100000, 2)["stt"] == 20
+    for args in (("bad", 100000, 1), ("BUY", 0, 1), ("BUY", float("nan"), 1),
+                 ("BUY", 100000, 0), ("BUY", 100000, 1.5), ("BUY", 100000, True)):
+        try:
+            silver_micro_estimated_order_charges(*args)
+        except ValueError:
+            continue
+        raise AssertionError("Invalid Silver charge input accepted: " + str(args))
 
 
 def test_brokerage_cap_and_rounding():

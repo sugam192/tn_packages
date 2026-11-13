@@ -90,6 +90,32 @@ def sum_charges(*breakdowns):
     return combined
 
 
+def silver_micro_estimated_order_charges(side, price, quantity):
+    """Illustrative one-order MCX Silver Micro charges, not contract-note rates."""
+    price = float(price)
+    if not isfinite(price) or price <= 0 or isinstance(quantity, bool):
+        raise ValueError("Silver charges require a finite positive price and whole lot count")
+    qty = int(quantity)
+    if qty <= 0 or qty != float(quantity):
+        raise ValueError("Silver charges require a finite positive price and whole lot count")
+    if side not in ("BUY", "SELL"):
+        raise ValueError("Charge side must be BUY or SELL")
+    turnover = Decimal(str(price)) * qty
+    charges = {
+        "brokerage": 20.0,
+        "stt": money(turnover * Decimal("0.0001"), whole_rupees=True) if side == "SELL" else 0.0,
+        "stamp_duty": money(turnover * Decimal("0.00002"), whole_rupees=True) if side == "BUY" else 0.0,
+        "exchange_txn": money(turnover * Decimal("0.000026")),
+        "sebi": money(turnover * Decimal("0.000001")),
+        "ipft": money(turnover * Decimal("0.000000001")),
+        "dp": 0.0,
+    }
+    base = sum(Decimal(str(charges[field])) for field in ("brokerage", "exchange_txn", "sebi", "ipft"))
+    charges["gst"] = money(Decimal("0.18") * base)
+    charges["total"] = money(sum(charges.values()))
+    return charges
+
+
 def option_spread_charges(quantity, long_entry, long_exit, short_entry, short_exit):
     return sum_charges(
         order_charges("options", "BUY", long_entry, quantity),
