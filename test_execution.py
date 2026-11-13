@@ -144,6 +144,51 @@ def test_best_price_entry_still_rejects_thin_or_wide_books():
            entry=True, best_price_only=True)
 
 
+def test_spread_opt_out_keeps_other_entry_checks():
+    book = quote()
+    book["depth"]["buy"][0]["price"] = 98
+    with patch.object(dhan, "execution_tick", return_value=0.05), \
+            patch.object(dhan, "get_depth", return_value=book), \
+            patch.object(dhan.time, "time", return_value=1000):
+        raises(ValueError, dhan.prepare_order, {"client_id": "test"}, "101", "BUY", 65,
+               "NSE_FNO", "INTRADAY", entry_deadline=1010, best_price_first=True)
+        plan = dhan.prepare_order({"client_id": "test"}, "101", "BUY", 65,
+                                  "NSE_FNO", "INTRADAY", entry_deadline=1010,
+                                  best_price_first=True, check_spread=False)
+    assert plan["request"]["price"] == 100.2
+    assert plan["policy"]["check_spread"] is False
+    assert plan["policy"]["max_price"] == 101.25
+    assert plan["policy"]["deadline"] == 1010
+    raises(ValueError, dhan.depth_limit, book, "BUY", 130, 0.05, entry=True, check_spread=False)
+    raises(ValueError, dhan.depth_limit, book, "BUY", 65, 0.05, 100.2, True, check_spread=False)
+    book["depth"]["buy"][0]["price"] = 103
+    raises(ValueError, dhan.depth_limit, book, "BUY", 65, 0.05, entry=True, check_spread=False)
+    raises(ValueError, dhan.depth_limit, quote(), "BUY", 65, 0.05, entry=True, check_spread="false")
+
+
+def test_spread_opt_out_survives_saved_policy_and_repricing():
+    book = quote()
+    book["depth"]["buy"][0]["price"] = 98
+    plan = prepared(1010)
+    plan["policy"]["check_spread"] = False
+    initial = order(price=100.2)
+    audit = Mock()
+    audit.insert_one.return_value = Mock(acknowledged=True)
+    with patch.object(dhan, "get_order",
+                      side_effect=[initial, initial, order("TRADED", 65)]), \
+            patch.object(dhan, "get_depth", return_value=book), \
+            patch.object(dhan.time, "time", return_value=1000), \
+            patch.object(dhan.time, "sleep"), \
+            patch.object(dhan, "modify_order") as modify, \
+            patch.object(dhan, "cancel_order") as cancel:
+        result = dhan.wait_for_fill({}, "123", prepared=plan,
+                                    audit_collection=audit, audit_id="trade:BUY")
+    assert result["filledQty"] == 65
+    assert audit.insert_one.call_args.args[0]["quote"] == book
+    cancel.assert_not_called()
+    modify.assert_called_once_with({}, "123", "LIMIT", 65, 100.4)
+
+
 def test_best_price_fill_gets_three_seconds_without_repricing():
     for side, deadline, expected_wait in (("BUY", 1010, 3), ("SELL", None, 3),
                                           ("BUY", 1002, 2)):
@@ -490,6 +535,7 @@ def test_swing_best_price_and_quote_are_saved_before_submission():
                                   dict(security_id="101", symbol="TEST"), 65, "BUY", now, None)
     assert result["filledQty"] == 65
     assert prepare.call_args.kwargs["best_price_first"] is True
+    assert prepare.call_args.kwargs["check_spread"] is False
     assert wait.call_args.kwargs["audit_collection"] is audit
     assert wait.call_args.kwargs["audit_id"] == "trade:BUY"
     assert docs["trade:BUY"]["prepared"]["initial_quote"]["quote"] == quote()

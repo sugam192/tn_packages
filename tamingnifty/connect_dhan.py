@@ -900,7 +900,9 @@ def get_depth(conn, security_id, exchange_segment):
 
 
 def depth_limit(quote, side, quantity, tick, max_price=None, entry=False,
-                best_price_only=False):
+                best_price_only=False, check_spread=True):
+    if not isinstance(check_spread, bool):
+        raise ValueError("check_spread must be a boolean")
     if side not in ("BUY", "SELL") or int(quantity) != quantity or quantity <= 0:
         raise ValueError("Invalid execution side/quantity")
     bids, asks = [], []
@@ -916,7 +918,7 @@ def depth_limit(quote, side, quantity, tick, max_price=None, entry=False,
     if not bids or not asks or bids[0][0] > asks[0][0]:
         raise ValueError("Missing or crossed bid/ask depth")
     midpoint = (asks[0][0] + bids[0][0]) / 2
-    if entry and (asks[0][0] - bids[0][0]) / midpoint > 0.0075:
+    if entry and check_spread and (asks[0][0] - bids[0][0]) / midpoint > 0.0075:
         raise ValueError("Entry spread exceeds 0.75%")
     available = 0
     levels = asks if side == "BUY" else bids
@@ -950,26 +952,31 @@ def depth_limit(quote, side, quantity, tick, max_price=None, entry=False,
 
 
 def prepare_order(conn, security_id, side, quantity, exchange_segment, product_type,
-                  entry_deadline=None, correlation_id=None, best_price_first=False):
+                  entry_deadline=None, correlation_id=None, best_price_first=False,
+                  check_spread=True):
     tick = execution_tick(security_id, exchange_segment)
     quote = get_depth(conn, security_id, exchange_segment)
     received_at = time.time() if best_price_first else None
     entry = entry_deadline is not None
     if entry and side != "BUY":
         raise ValueError("Entry policy is for a long BUY only")
-    price, reference = depth_limit(quote, side, quantity, tick, entry=entry)
+    price, reference = depth_limit(quote, side, quantity, tick, entry=entry,
+                                   check_spread=check_spread)
     policy = dict(tick=tick)
+    if not check_spread:
+        policy["check_spread"] = False
     if entry:
         if not math.isfinite(float(entry_deadline)) or float(entry_deadline) <= time.time():
             raise ValueError("Invalid or expired entry deadline")
         policy.update(deadline=min(float(entry_deadline), time.time() + 15),
                       max_price=round_execution_price(
                           Decimal(str(reference)) * Decimal("1.01"), tick, "SELL"))
-        price, _ = depth_limit(quote, side, quantity, tick, policy["max_price"], entry=True)
+        price, _ = depth_limit(quote, side, quantity, tick, policy["max_price"], entry=True,
+                               check_spread=check_spread)
     if best_price_first:
         price, reference = depth_limit(quote, side, quantity, tick,
                                        policy.get("max_price"), entry=entry,
-                                       best_price_only=True)
+                                       best_price_only=True, check_spread=check_spread)
         policy["best_price_first"] = True
     body = dict(dhanClientId=conn["client_id"], transactionType=side,
                 exchangeSegment=exchange_segment, productType=product_type,
@@ -1326,7 +1333,8 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
                     snapshot["received_at"] = time.time()
                 price, reference = depth_limit(quote, order["transactionType"], remaining, tick,
                                        policy.get("max_price"),
-                                       entry=policy.get("deadline") is not None)
+                                       entry=policy.get("deadline") is not None,
+                                       check_spread=policy.get("check_spread", True))
             except ValueError as error:
                 snapshot["error"] = str(error)
                 save_execution_quote(audit_collection, audit_id, snapshot)

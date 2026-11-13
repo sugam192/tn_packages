@@ -8,8 +8,9 @@ trading infrastructure.
 The published page contains this guide **and the complete API reference below
 it**, including broker, utility, charge and safety functions. In a source
 checkout, the reference is also stored as `API_REFERENCE.md`.
-Version 2.4.4 changes documentation, packaging metadata and documentation tests
-only; chart and trading algorithms are unchanged.
+Version 2.4.5 adds an opt-out for the entry spread check. The
+default remains unchanged, and the choice is saved with the order policy for
+repricing and recovery. It does not remove other entry protections.
 
 ## Installation
 

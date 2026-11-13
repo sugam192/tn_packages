@@ -328,7 +328,7 @@ checking does not prove exchange-timestamp freshness.
 
 ### connect_dhan.depth_limit
 
-`depth_limit(quote, side, quantity, tick, max_price=None, entry=False, best_price_only=False)`
+`depth_limit(quote, side, quantity, tick, max_price=None, entry=False, best_price_only=False, check_spread=True)`
 
 **Pure execution-pricing helper.** Return `(limit_price, reference_price)`.
 Requires positive integral quantity, `"BUY"`/`"SELL"`, positive tick and a quote
@@ -342,13 +342,15 @@ or the last displayed level if depth is insufficient. Adds a 0.1% cushion
 (BUY up, SELL down), rounds to tick, then clamps within circuit bounds and
 optional `max_price` (an upper cap, including for SELL).
 `best_price_only=True` instead references the best opposite-side price with
-no cushion. With `entry=True`, rejects spread over 0.75%, insufficient depth
-and a capped price below reference. Raises on invalid data or unusable bounds;
+no cushion. With `entry=True`, rejects spread over 0.75% by default, insufficient
+depth and a capped price below reference. Set `check_spread=False` to disable
+only the spread rejection; crossed or missing books and the other entry checks
+still fail. Raises on invalid data or unusable bounds;
 it neither fetches a quote nor guarantees a fill.
 
 ### connect_dhan.prepare_order
 
-`prepare_order(conn, security_id, side, quantity, exchange_segment, product_type, entry_deadline=None, correlation_id=None, best_price_first=False)`
+`prepare_order(conn, security_id, side, quantity, exchange_segment, product_type, entry_deadline=None, correlation_id=None, best_price_first=False, check_spread=True)`
 
 **Network operation, but does not submit an order.** Read strict master tick and
 live depth, then return `{"request": body, "policy": policy}` for a LIMIT/DAY
@@ -362,6 +364,9 @@ a tick-rounded upper price cap 1% above the original depth reference.
 is made. `best_price_first=True` starts at best opposite-side price and adds
 `initial_quote` with receipt time, quote, remaining quantity, reference and
 limit price. It also sets the policy flag used by `wait_for_fill`.
+`check_spread=False` disables the spread rejection during both preparation and
+subsequent repricing; the choice is saved in `policy`. Older saved policies
+without this flag retain the spread check.
 Validation/depth/master errors propagate. Returned request contains client ID;
 do not publish it.
 
