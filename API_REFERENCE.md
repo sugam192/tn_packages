@@ -586,7 +586,7 @@ reconciliation and all partial positions. Terminal REJECTED/CANCELLED/EXPIRED
 does not mean fully filled. HTTP/validation failures can exit with an order
 still live; do not treat exceptions as proof that no position exists.
 
-Local version2.4.7 adds optional synchronous `on_event(message)` callbacks
+Version 2.4.7 (published 2026-11-24) adds optional synchronous `on_event(message)` callbacks
 for initial unfilled status, partial fills, repricing quote requests/results,
 HTTP 429 retries of the repricing quote (passed on to `get_depth`),
 audit acknowledgement, modification requests/responses and broker-confirmed
@@ -608,7 +608,7 @@ Counts are not reconstructed after a process restart. No new Mongo fields.
 With a callback, BUY deadlines are rechecked after the modification notice;
 depth older than three seconds since receipt is not used for modification.
 Slow callbacks may still delay reconciliation or exits; this is not a
-guaranteed wall-clock deadline or fill. The new release is not published here.
+guaranteed wall-clock deadline or fill.
 
 ## connect_definedge
 

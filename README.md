@@ -12,7 +12,7 @@ Version 2.4.5 adds an opt-out for the entry spread check. The
 default remains unchanged, and the choice is saved with the order policy for
 repricing and recovery. It does not remove other entry protections.
 
-Local version2.4.7 adds optional order-monitor event callbacks for unfilled/
+Version 2.4.7 (published 2026-11-24) adds optional order-monitor event callbacks for unfilled/
 partial orders, repricing, modifications, cancellations and broker confirmation.
 It also makes `get_depth` re-run itself after an HTTP 429 (`DhanRateLimited`,
 `@retry`: pauses of 2 then 4 seconds, three attempts), reports each such retry
@@ -27,8 +27,7 @@ accepted repricing requests, and reports quote/audit/modification errors
 and cancellation requests/unconfirmed responses immediately. Optional
 notification state can retain the count across passes; it is not broker policy.
 Interceptor batches routine Slack events after monitoring; see the API reference
-for callback and process-restart limitations.
-No release/publication or consumer deployment is implied by these source edits.
+for callback and process-restart limitations. Only the Interceptor opts in so far.
 
 ## Installation
 
