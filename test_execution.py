@@ -675,6 +675,304 @@ def test_swing_submission_persists_policy_before_network_and_does_not_repeat():
     wait.assert_called_once()
 
 
+def test_swing_phase_alerts_preserve_quote_submission_and_fill_timing():
+    now = datetime(2026, 11, 23, 9, 33, 10)
+    orders, docs = collection()
+    alerts = Mock()
+    plan = prepared(1010)
+
+    def submit(conn, value):
+        assert alerts.call_count == 0
+        assert docs["trade:BUY"]["prepared"] == plan
+        return dict(orderId="123", orderStatus="PENDING")
+
+    def wait(*args, **kwargs):
+        assert alerts.call_count == 0
+        kwargs["on_event"]("Order not fully filled; remaining 65")
+        assert alerts.call_count == 0
+        kwargs["on_event"]("Requesting LIMIT modification")
+        assert alerts.call_count == 0
+        return order("TRADED", 65)
+
+    with patch.object(swing, "now_ist", return_value=now), \
+            patch.object(dhan, "prepare_order", return_value=plan), \
+            patch.object(dhan, "submit_prepared_order", side_effect=submit), \
+            patch.object(dhan, "wait_for_fill", side_effect=wait):
+        swing.live_order({}, orders, "trade:BUY", dict(security_id="101", symbol="TEST"),
+                         65, "BUY", now, None, report=alerts)
+    messages = [call.args[0] for call in alerts.call_args_list]
+    assert len(messages) == 1
+    assert "Requesting fresh depth" in messages[0]
+    stages = ["Fresh depth prepared", "placing LIMIT order now", "Order submitted",
+              "monitoring same order"]
+    positions = [messages[0].index(stage) for stage in stages]
+    assert positions == sorted(positions)
+    assert "Order not fully filled" in messages[0]
+    assert "Requesting LIMIT modification" in messages[0]
+    assert "Broker result TRADED" in messages[0] and "full fill confirmed" in messages[0]
+
+
+def test_swing_monitor_alert_is_immediate_and_timeline_waits_for_persisted_fill():
+    now = datetime(2026, 11, 23, 9, 33, 10)
+    stored = dict(_id="trade:BUY", simulated=False, prepared=prepared(1010), **order())
+    orders, docs = collection(stored)
+    alerts = Mock()
+
+    def wait(*args, **kwargs):
+        kwargs["on_event"]("Fresh repricing quote saved")
+        assert alerts.call_count == 0
+        kwargs["on_alert"]("Still not fully filled after 2 accepted repricing requests")
+        assert alerts.call_count == 1
+        assert docs["trade:BUY"]["orderStatus"] == "PENDING"
+        kwargs["on_event"]("Broker-confirmed LIMIT changed")
+        assert alerts.call_count == 1
+        return order("TRADED", 65)
+
+    def report(message):
+        if "execution update:" in message:
+            assert docs["trade:BUY"]["orderStatus"] == "TRADED"
+            assert docs["trade:BUY"]["fill_timestamp"] == str(now)
+        alerts(message)
+
+    with patch.object(swing, "now_ist", return_value=now), \
+            patch.object(swing, "ORDER_NOTIFICATION_STATE", {}), \
+            patch.object(dhan, "wait_for_fill", side_effect=wait):
+        swing.live_order({}, orders, "trade:BUY", dict(security_id="101"),
+                         65, "BUY", now, stored, report=report)
+    assert alerts.call_count == 2
+    assert "2 accepted repricing requests" in alerts.call_args_list[0].args[0]
+    assert "Fresh repricing quote saved" in alerts.call_args_list[1].args[0]
+    assert "full fill confirmed" in alerts.call_args_list[1].args[0]
+    assert not swing.ORDER_NOTIFICATION_STATE
+
+
+def test_swing_quote_429_retries_join_the_batched_timeline_and_never_alert_early():
+    now = datetime(2026, 11, 23, 9, 33, 10)
+    orders, docs = collection()
+    alerts = Mock()
+    plan = prepared(1010)
+
+    def prepare(*args, **kwargs):
+        kwargs["on_event"]("Quote request got HTTP 429; asking again after a short pause")
+        assert alerts.call_count == 0
+        return plan
+
+    with patch.object(swing, "now_ist", return_value=now), \
+            patch.object(dhan, "prepare_order", side_effect=prepare), \
+            patch.object(dhan, "submit_prepared_order", return_value=dict(orderId="123")), \
+            patch.object(dhan, "wait_for_fill", return_value=order("TRADED", 65)):
+        swing.live_order({}, orders, "trade:BUY", dict(security_id="101", symbol="TEST"),
+                         65, "BUY", now, None, report=alerts)
+    assert alerts.call_count == 1
+    timeline = alerts.call_args.args[0]
+    stages = ["Requesting fresh depth", "BUY | Quote request got HTTP 429", "Fresh depth prepared",
+              "placing LIMIT order now", "Order submitted", "full fill confirmed"]
+    positions = [timeline.index(stage) for stage in stages]
+    assert positions == sorted(positions)
+
+
+def test_swing_failed_quote_reports_no_submission_and_retains_pending_trade():
+    now = datetime(2026, 11, 23, 9, 33, 10)
+    trade = dict(_id="trade", strategy_state="pending", simulated=False,
+                 entry_signal="2026-11-23 09:32:00", security_id="101",
+                 long_option_symbol="TEST", quantity=65)
+    strategies, trade_docs = collection(trade)
+    orders, order_docs = collection()
+    alerts = Mock()
+    failure = RuntimeError("Dhan HTTP 429: Too many requests")
+    with patch.object(swing, "now_ist", return_value=now), \
+            patch.object(dhan, "prepare_order", side_effect=failure), \
+            patch.object(dhan, "submit_prepared_order") as submit:
+        raises(RuntimeError, swing.open_pending, {}, strategies, orders, trade, now, report=alerts)
+    assert trade_docs["trade"]["strategy_state"] == "pending"
+    assert not order_docs
+    submit.assert_not_called()
+    messages = [call.args[0] for call in alerts.call_args_list]
+    assert len(messages) == 1
+    assert "Quote/preparation failed" in messages[0] and "429" in messages[0]
+    assert "no order submitted" in messages[0]
+    assert not any("full fill confirmed" in message for message in messages)
+
+
+def test_swing_recovery_and_zero_fill_alerts_do_not_claim_success_or_resubmit():
+    now = datetime(2026, 11, 23, 9, 33, 10)
+    stored = dict(_id="trade:BUY", simulated=False, orderStatus="SUBMITTING",
+                  prepared=prepared(1010), correlationId="intent")
+    orders, _ = collection(stored)
+    alerts = Mock()
+    with patch.object(dhan, "order_by_correlation", return_value=order()), \
+            patch.object(dhan, "wait_for_fill", return_value=order("CANCELLED")), \
+            patch.object(dhan, "submit_prepared_order") as submit:
+        result = swing.live_order({}, orders, "trade:BUY", dict(security_id="101"),
+                                  65, "BUY", now, stored, report=alerts)
+    assert result["filledQty"] == 0
+    submit.assert_not_called()
+    messages = "\n".join(call.args[0] for call in alerts.call_args_list)
+    assert "Reconciling saved order" in messages and "Looking up submission" in messages
+    assert "Broker result CANCELLED" in messages and "filled 0/65" in messages
+    assert "placing LIMIT" not in messages and "full fill confirmed" not in messages
+
+
+def test_swing_submission_and_monitoring_failures_keep_uncertainty_explicit():
+    now = datetime(2026, 11, 23, 9, 33, 10)
+    for failing_stage in ("submission", "monitoring"):
+        orders, docs = collection()
+        alerts = Mock()
+        error = RuntimeError("Response unavailable")
+        with patch.object(swing, "now_ist", return_value=now), \
+                patch.object(dhan, "prepare_order", return_value=prepared(1010)), \
+                patch.object(dhan, "submit_prepared_order",
+                             side_effect=error if failing_stage == "submission" else None,
+                             return_value=dict(orderId="123")) as submit, \
+                patch.object(dhan, "wait_for_fill", side_effect=error) as wait:
+            raises(RuntimeError, swing.live_order, {}, orders, "trade:BUY",
+                   dict(security_id="101", symbol="TEST"), 65, "BUY", now, None, report=alerts)
+        assert "trade:BUY" in docs
+        submit.assert_called_once()
+        messages = "\n".join(call.args[0] for call in alerts.call_args_list)
+        assert "full fill confirmed" not in messages
+        if failing_stage == "submission":
+            wait.assert_not_called()
+            assert "Submission failed or unconfirmed" in messages and "do not send another order" in messages
+        else:
+            wait.assert_called_once()
+            assert "Fill monitoring failed" in messages and "may still be working" in messages
+
+
+def test_monitor_initial_wait_accounts_for_notification_time_before_buy_deadline():
+    plan = prepared(1002)
+    plan["policy"]["best_price_first"] = True
+    clock = {"epoch": 1000}
+
+    def event(message):
+        if "not fully filled at initial LIMIT" in message:
+            clock["epoch"] = 1001.5
+
+    with patch.object(dhan, "get_order", side_effect=[order(), order("TRADED", 65)]), \
+            patch.object(dhan.time, "time", side_effect=lambda: clock["epoch"]), \
+            patch.object(dhan.time, "sleep") as sleep:
+        result = dhan.wait_for_fill({}, "123", prepared=plan, on_event=event)
+    assert result["filledQty"] == 65
+    sleep.assert_called_once_with(0.5)
+
+
+def test_monitor_events_report_partial_repricing_then_broker_confirmed_change():
+    plan = prepared(1010)
+    plan["policy"]["best_price_first"] = True
+    partial = order("PART_TRADED", 30, price=100.2)
+    filled = order("TRADED", 65, price=100.4)
+    events = []
+    audit = Mock()
+    audit.insert_one.return_value = Mock(acknowledged=True)
+
+    def modify(*args):
+        assert "Requesting LIMIT modification" in events[-1]
+        assert audit.insert_one.call_count == 1
+        assert args[3] == 65
+
+    with patch.object(dhan, "get_order", side_effect=[partial, partial, partial, filled]), \
+            patch.object(dhan, "get_depth", return_value=quote()), \
+            patch.object(dhan.time, "time", return_value=1000), \
+            patch.object(dhan.time, "sleep"), \
+            patch.object(dhan, "modify_order", side_effect=modify) as changed:
+        result = dhan.wait_for_fill({}, "123", prepared=plan, audit_collection=audit,
+                                    audit_id="trade:BUY", on_event=events.append)
+    changed.assert_called_once()
+    assert result["filledQty"] == 65
+    combined = "\n".join(events)
+    stages = ["not fully filled at initial LIMIT", "requesting fresh depth",
+              "Fresh repricing depth received", "Repricing quote saved",
+              "Requesting LIMIT modification", "Modification response received",
+              "Broker-confirmed LIMIT changed", "Broker status TRADED"]
+    positions = [combined.index(stage) for stage in stages]
+    assert positions == sorted(positions)
+    assert "remaining 35" in combined
+    assert "Rs100.20 -> Rs100.40" in combined
+    assert "total Qty 65 unchanged" in combined
+
+
+def test_monitor_fill_race_reports_skipped_modification_not_a_modified_order():
+    events = []
+    with patch.object(dhan, "get_order", side_effect=[order(price=99), order("TRADED", 65)]), \
+            patch.object(dhan, "get_depth", return_value=quote()), \
+            patch.object(dhan.time, "time", return_value=1000), \
+            patch.object(dhan, "modify_order") as modify:
+        result = dhan.wait_for_fill({}, "123", prepared=prepared(1010), on_event=events.append)
+    assert result["filledQty"] == 65
+    modify.assert_not_called()
+    combined = "\n".join(events)
+    assert "became TRADED while evaluating quote | modification skipped" in combined
+    assert "Requesting LIMIT modification" not in combined
+    assert "Broker-confirmed LIMIT changed" not in combined
+
+
+def test_monitor_quote_and_modification_errors_report_unconfirmed_state():
+    for failure in ("quote", "modify"):
+        events = []
+        alerts = []
+        state = dict(repricings=0, warned=False)
+        error = RuntimeError("HTTP 429" if failure == "quote" else "Modify response unavailable")
+        with patch.object(dhan, "get_order", return_value=order(price=99)), \
+                patch.object(dhan, "execution_tick", return_value=0.05), \
+                patch.object(dhan, "get_depth",
+                             side_effect=error if failure == "quote" else None,
+                             return_value=quote()), \
+                patch.object(dhan, "modify_order", side_effect=error) as modify:
+            raises(RuntimeError, dhan.wait_for_fill, {}, "123", on_event=events.append,
+                   on_alert=alerts.append, notification_state=state)
+        combined = "\n".join(events)
+        assert "Broker status TRADED" not in combined and "Broker-confirmed LIMIT changed" not in combined
+        if failure == "quote":
+            modify.assert_not_called()
+            assert "Repricing quote request failed" in combined and "HTTP 429" in combined
+            assert "no modification sent" in combined
+        else:
+            modify.assert_called_once()
+            assert "Modification failed/unconfirmed" in combined
+            assert "Modification response received" not in combined
+        assert len(alerts) == 1 and alerts[0] in combined
+        assert state == dict(repricings=0, warned=False)
+
+
+def test_monitor_two_accepted_reprices_alert_once_across_passes_unless_filled():
+    for fully_filled in (False, True):
+        state = dict(repricings=0, warned=False)
+        alerts = []
+        first = order(price=99)
+        second = order("PART_TRADED", 30, price=100.4)
+        last = order("TRADED" if fully_filled else "PART_TRADED",
+                     65 if fully_filled else 30, price=100.65)
+        for before, after, price in ((first, second, 100.4), (second, last, 100.65)):
+            def modify(*args):
+                assert not alerts
+                assert args[3] == 65
+
+            with patch.object(dhan, "get_order", side_effect=[before, before, after]), \
+                    patch.object(dhan, "get_depth", return_value=quote()), \
+                    patch.object(dhan, "depth_limit", return_value=(price, price)), \
+                    patch.object(dhan.time, "monotonic", side_effect=[0, 0, 0, 0, 11]), \
+                    patch.object(dhan.time, "sleep"), \
+                    patch.object(dhan, "modify_order", side_effect=modify) as changed, \
+                    patch.object(dhan, "warn_order_never_filled"):
+                result = dhan.wait_for_fill({}, "123", prepared=prepared(),
+                                            on_event=lambda message: None,
+                                            on_alert=alerts.append, notification_state=state)
+            changed.assert_called_once()
+        assert state["repricings"] == 2
+        assert len(alerts) == (0 if fully_filled else 1)
+        if fully_filled:
+            assert result["orderStatus"] == "TRADED" and not state["warned"]
+        else:
+            assert "filled 30/65" in alerts[0] and "remaining 35" in alerts[0]
+            assert "LIMIT Rs100.65" in alerts[0] and state["warned"]
+            with patch.object(dhan, "get_order", return_value=last), \
+                    patch.object(dhan.time, "monotonic", side_effect=[0, 11]), \
+                    patch.object(dhan, "warn_order_never_filled"):
+                dhan.wait_for_fill({}, "123", prepared=prepared(),
+                                   on_alert=alerts.append, notification_state=state)
+            assert len(alerts) == 1
+
+
 def test_quote_throttle_and_slow_or_failed_responses():
     response = Mock(status_code=200)
     response.json.return_value = dict(status="success", data={"NSE_FNO": {"101": quote()}})
@@ -689,6 +987,210 @@ def test_quote_throttle_and_slow_or_failed_responses():
             patch.object(dhan.requests, "post", return_value=response):
         raises(ValueError, dhan.get_depth, {"client_id": "test", "access_token": "test"},
                "101", "NSE_FNO")
+
+
+def quote_reply(status):
+    response = Mock(status_code=status, url="https://api.dhan.co/v2/marketfeed/quote")
+    if status == 200:
+        response.json.return_value = dict(status="success", data={"NSE_FNO": {"101": quote()}})
+    else:
+        response.json.return_value = {
+            "data": {"805": "Too many requests. Further requests may result in the user being blocked."},
+            "status": "failed"}
+    return response
+
+
+def test_429_raises_a_retryable_error_and_every_other_failure_does_not():
+    def failure(response):
+        try:
+            dhan.check_dhan_response(response)
+        except Exception as error:
+            return error
+        raise AssertionError("Expected an error")
+
+    limited = failure(quote_reply(429))
+    assert isinstance(limited, dhan.DhanRateLimited) and isinstance(limited, Exception)
+    assert str(limited).startswith("Dhan returned HTTP 429 for https://api.dhan.co/v2/marketfeed/quote - ")
+    assert "Too many requests" in str(limited)
+    for status in (400, 401, 500):
+        other = failure(quote_reply(status))
+        assert not isinstance(other, dhan.DhanRateLimited)
+        assert f"HTTP {status}" in str(other)
+    assert dhan.check_dhan_response(quote_reply(200)) is None
+
+
+def test_depth_asks_again_after_two_then_four_seconds_on_429_only():
+    conn = {"client_id": "test", "access_token": "test"}
+    clock = {"now": 1000.0}
+
+    def tick():
+        clock["now"] += 1
+        return clock["now"]
+
+    for replies, attempts, sleeps in (
+            ([429, 200], 2, [2]), ([429, 429, 200], 3, [2, 4]), ([429, 429, 429], 3, [2, 4])):
+        events = []
+        posts = [quote_reply(status) for status in replies]
+        with patch.object(dhan, "_last_depth_request", 0), \
+                patch.object(dhan.time, "monotonic", side_effect=tick), \
+                patch.object(dhan.time, "sleep") as sleep, \
+                patch.object(dhan.requests, "post", side_effect=posts) as post:
+            if replies[-1] == 200:
+                assert dhan.get_depth(conn, "101", "NSE_FNO", on_event=events.append) == quote()
+            else:
+                raises(dhan.DhanRateLimited, dhan.get_depth, conn, "101", "NSE_FNO",
+                       on_event=events.append)
+        assert post.call_count == attempts
+        assert [call.args[0] for call in sleep.call_args_list] == sleeps
+        assert len(events) == replies.count(429)
+        assert all("HTTP 429" in message and "asking again" in message for message in events)
+    # Nothing but a 429 is retried: a bad request or a stale quote fails at once.
+    for reply, error in ((quote_reply(400), Exception), (quote_reply(200), ValueError)):
+        stale = iter([2000, 2000, 2010]) if error is ValueError else None
+        with patch.object(dhan, "_last_depth_request", 0), \
+                patch.object(dhan.time, "monotonic",
+                             side_effect=(lambda: next(stale)) if stale else tick), \
+                patch.object(dhan.time, "sleep") as sleep, \
+                patch.object(dhan.requests, "post", return_value=reply) as post:
+            raises(error, dhan.get_depth, conn, "101", "NSE_FNO")
+        post.assert_called_once()
+        assert [call.args[0] for call in sleep.call_args_list if call.args[0] >= 2] == []
+
+
+def test_prepare_order_and_repricing_pass_the_event_hook_to_depth():
+    events = []
+    with patch.object(dhan, "execution_tick", return_value=0.05), \
+            patch.object(dhan, "get_depth", return_value=quote()) as depth:
+        dhan.prepare_order({"client_id": "test"}, "101", "SELL", 65, "NSE_FNO", "INTRADAY",
+                           on_event=events.append)
+    assert depth.call_args.kwargs["on_event"] == events.append
+    with patch.object(dhan, "get_order", side_effect=[order(price=99), order(price=99), order("TRADED", 65)]), \
+            patch.object(dhan, "get_depth", return_value=quote()) as depth, \
+            patch.object(dhan.time, "time", return_value=1000), \
+            patch.object(dhan.time, "sleep"), \
+            patch.object(dhan, "modify_order"):
+        dhan.wait_for_fill({}, "123", prepared=prepared(1010), on_event=events.append)
+    assert depth.call_args.kwargs["on_event"] == events.append
+
+
+def test_every_dhan_request_prints_a_millisecond_timestamp_for_later_correlation():
+    conn = {"client_id": "test", "access_token": "test"}
+    ltp = Mock(status_code=200)
+    ltp.json.return_value = dict(data={"NSE_FNO": {"101": {"last_price": 100.2}}})
+    candles = Mock(status_code=200)
+    moment = datetime(2026, 11, 23, 9, 33, 19, 123456)
+    with patch.object(dhan.util, "ist_now", return_value=moment), \
+            patch.object(dhan, "_last_depth_request", 0), \
+            patch.object(dhan.time, "sleep"), \
+            patch.object(dhan, "candles_to_dataframe", return_value="frame"), \
+            patch.object(dhan.requests, "post", side_effect=[quote_reply(200), ltp, candles]), \
+            patch("builtins.print") as printed:
+        dhan.get_depth(conn, "101", "NSE_FNO")
+        assert dhan.get_ltp(conn, "101", "NSE_FNO") == 100.2
+        assert dhan.fetch_one_chunk(conn, "101", "NSE_FNO", "OPTIDX", datetime(2026, 11, 23),
+                                    datetime(2026, 11, 23), "min") == "frame"
+    lines = [call.args[0] for call in printed.call_args_list]
+    assert lines == ["Dhan quote request at 09:33:19.123 IST", "Dhan LTP request at 09:33:19.123 IST",
+                     "Dhan candles request at 09:33:19.123 IST"]
+
+
+def test_monitor_quote_evaluations_without_modification_do_not_trigger_alert():
+    clock = {"monotonic": 0}
+    state = dict(repricings=0, warned=False)
+    alerts = []
+    audit = Mock()
+    audit.insert_one.return_value = Mock(acknowledged=True)
+
+    def sleep(seconds):
+        clock["monotonic"] += seconds
+
+    with patch.object(dhan, "get_order", return_value=order()), \
+            patch.object(dhan, "get_depth", return_value=quote()) as depth, \
+            patch.object(dhan.time, "monotonic", side_effect=lambda: clock["monotonic"]), \
+            patch.object(dhan.time, "sleep", side_effect=sleep), \
+            patch.object(dhan, "modify_order") as modify, \
+            patch.object(dhan, "warn_order_never_filled"):
+        result = dhan.wait_for_fill({}, "123", prepared=prepared(),
+                                    audit_collection=audit, audit_id="trade:BUY",
+                                    on_alert=alerts.append, notification_state=state)
+    assert depth.call_count >= 2 and audit.insert_one.call_count == depth.call_count
+    modify.assert_not_called()
+    assert not alerts and state == dict(repricings=0, warned=False)
+    assert result["orderStatus"] == "PENDING"
+
+
+def test_monitor_rechecks_buy_deadline_after_immediate_modification_notice():
+    events = []
+    clock = {"epoch": 1000}
+
+    def event(message):
+        events.append(message)
+        if "Requesting LIMIT modification" in message:
+            clock["epoch"] = 1011
+
+    with patch.object(dhan, "get_order",
+                      side_effect=[order(price=99), order(price=99), order("CANCELLED")]), \
+            patch.object(dhan, "get_depth", return_value=quote()), \
+            patch.object(dhan.time, "time", side_effect=lambda: clock["epoch"]), \
+            patch.object(dhan.time, "monotonic", return_value=0), \
+            patch.object(dhan.time, "sleep"), \
+            patch.object(dhan, "cancel_order") as cancel, \
+            patch.object(dhan, "modify_order") as modify:
+        result = dhan.wait_for_fill({}, "123", prepared=prepared(1010), on_event=event)
+    assert result["orderStatus"] == "CANCELLED"
+    modify.assert_not_called()
+    cancel.assert_called_once()
+    combined = "\n".join(events)
+    assert "Entry deadline reached during notification" in combined
+    assert combined.index("requesting cancellation") < combined.index("Broker status CANCELLED")
+
+
+def test_monitor_notification_quote_age_boundary_prevents_stale_repricing():
+    for age in (3, 3.01):
+        events = []
+        clock = {"monotonic": 0}
+
+        def event(message):
+            events.append(message)
+            if "Requesting LIMIT modification" in message:
+                clock["monotonic"] = age
+            if "depth expired during notifications" in message:
+                clock["monotonic"] = 11
+
+        pending = order(side="SELL", price=101)
+        filled = order("TRADED", 65, side="SELL", price=99.9)
+        with patch.object(dhan, "get_order", side_effect=[pending, pending, filled]), \
+                patch.object(dhan, "execution_tick", return_value=0.05), \
+                patch.object(dhan, "get_depth", return_value=quote()), \
+                patch.object(dhan.time, "monotonic", side_effect=lambda: clock["monotonic"]), \
+                patch.object(dhan.time, "sleep"), \
+                patch.object(dhan, "modify_order") as modify, \
+                patch.object(dhan, "warn_order_never_filled"):
+            result = dhan.wait_for_fill({}, "123", on_event=event)
+        combined = "\n".join(events)
+        if age == 3:
+            modify.assert_called_once()
+            assert result["orderStatus"] == "TRADED"
+        else:
+            modify.assert_not_called()
+            assert result["orderStatus"] == "PENDING"
+            assert "depth expired during notifications" in combined
+            assert "same-order recovery required" in combined
+
+
+def test_monitor_failed_cancellation_is_not_reported_as_cancelled():
+    events = []
+    alerts = []
+    with patch.object(dhan, "get_order", return_value=order()), \
+            patch.object(dhan.time, "time", return_value=1011), \
+            patch.object(dhan, "cancel_order", side_effect=RuntimeError("Response unavailable")):
+        raises(RuntimeError, dhan.wait_for_fill, {}, "123", prepared=prepared(1010),
+               on_event=events.append, on_alert=alerts.append)
+    combined = "\n".join(events)
+    assert "Cancellation failed/unconfirmed" in combined
+    assert "Cancellation request returned" not in combined and "Broker status CANCELLED" not in combined
+    assert len(alerts) == 2 and "requesting cancellation" in alerts[0]
+    assert "Cancellation failed/unconfirmed" in alerts[1]
 
 
 def test_http_limit_payload_cancel_and_correlation_recovery():
@@ -720,6 +1222,34 @@ def test_deadline_is_rechecked_after_quote_before_modify():
         assert dhan.wait_for_fill({}, "123", prepared=prepared(1010))["filledQty"] == 0
     cancel.assert_called_once()
     modify.assert_not_called()
+
+
+def test_swing_live_startup_refuses_library_without_monitor_events_before_external_work():
+    with patch.object(swing, "load_dotenv"), patch.object(swing, "find_dotenv", return_value=""), \
+            patch.object(swing, "settings", return_value=dict(simulated=False)), \
+            patch.object(swing, "dhan", Mock(spec=["prepare_order"])), \
+            patch.object(swing, "MongoClient") as mongo, \
+            patch.object(swing, "WebClient") as slack:
+        raises(RuntimeError, swing.main)
+    mongo.assert_not_called()
+    slack.assert_not_called()
+    old = Mock(spec=["execution_event", "wait_for_fill", "prepare_order"])
+    old.wait_for_fill = lambda conn, order_id, on_event=None: None
+    old.prepare_order = lambda conn, on_event=None: None
+    with patch.object(swing, "load_dotenv"), patch.object(swing, "find_dotenv", return_value=""), \
+            patch.object(swing, "settings", return_value=dict(simulated=False)), \
+            patch.object(swing, "dhan", old), patch.object(swing, "MongoClient") as mongo:
+        raises(RuntimeError, swing.main)
+    mongo.assert_not_called()
+    # A library with the notification hooks but a prepare_order that cannot report 429s.
+    partly = Mock(spec=["execution_event", "wait_for_fill", "prepare_order"])
+    partly.wait_for_fill = lambda conn, order_id, on_alert=None, notification_state=None: None
+    partly.prepare_order = lambda conn: None
+    with patch.object(swing, "load_dotenv"), patch.object(swing, "find_dotenv", return_value=""), \
+            patch.object(swing, "settings", return_value=dict(simulated=False)), \
+            patch.object(swing, "dhan", partly), patch.object(swing, "MongoClient") as mongo:
+        raises(RuntimeError, swing.main)
+    mongo.assert_not_called()
 
 
 def test_swing_main_uses_interceptor_trades_and_orders_with_existing_signal():

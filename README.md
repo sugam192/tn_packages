@@ -12,6 +12,24 @@ Version 2.4.5 adds an opt-out for the entry spread check. The
 default remains unchanged, and the choice is saved with the order policy for
 repricing and recovery. It does not remove other entry protections.
 
+Local version2.4.7 adds optional order-monitor event callbacks for unfilled/
+partial orders, repricing, modifications, cancellations and broker confirmation.
+It also makes `get_depth` re-run itself after an HTTP 429 (`DhanRateLimited`,
+`@retry`: pauses of 2 then 4 seconds, three attempts), reports each such retry
+through the same callback, and prints one timestamped console line per Dhan request
+(`log_dhan_request`) so a future 429 can be matched against what other bots were
+doing. `get_ltp` and the candle fetch keep their existing retries. There is no
+cross-bot limiter: an investigation (2026-11-23) found no evidence that bots
+collide, so that heavier design was built, tested and deliberately not kept.
+Routine `on_event` and exceptional `on_alert` callbacks are separate.
+The exceptional callback warns once if still unfilled/partial after two
+accepted repricing requests, and reports quote/audit/modification errors
+and cancellation requests/unconfirmed responses immediately. Optional
+notification state can retain the count across passes; it is not broker policy.
+Interceptor batches routine Slack events after monitoring; see the API reference
+for callback and process-restart limitations.
+No release/publication or consumer deployment is implied by these source edits.
+
 ## Installation
 
 ```bash
@@ -214,6 +232,16 @@ Audit-write failures stop repricing and surface to the caller; the existing
 order can remain working. Broker fetch failures cannot supply a depth
 snapshot and still surface explicitly. REST provides only its returned
 depth levels, not the entire exchange order book or proof of source freshness.
+
+Local2.4.7 adds `on_event(message)` to `wait_for_fill`. The callback runs
+synchronously at each monitoring phase; default callers remain unchanged.
+Messages distinguish a pricing candidate, a modification request/response,
+and a subsequent broker-confirmed limit change. A fill race skips modification
+and reports that distinction. Callback-enabled repricing rechecks BUY deadlines
+and rejects depth older than three seconds after notification delays.
+Immediate notifications can slow execution; a callback should not place
+replacement orders or override the saved policy. Publish the shared release
+before pinning/building a consumer for deployment.
 
 Only opted-in consumers use best-price-first. Existing generic callers keep
 their execution behavior. Neither this policy nor a lower sell limit guarantees

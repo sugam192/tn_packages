@@ -665,6 +665,7 @@ def fetch_one_chunk(conn, security_id, exchange_segment, instrument, start, end,
         url = f"{API_BASE}/charts/intraday"
         body["interval"] = "1"
 
+    log_dhan_request("candles")
     response = requests.post(url, headers=build_headers(conn), json=body, timeout=60)
     check_dhan_response(response)
     return candles_to_dataframe(response.json())
@@ -741,6 +742,7 @@ def get_ltp(conn, security_id, exchange_segment):
     Note this endpoint also wants the client id in the headers, which the candle
     endpoints do not.
     """
+    log_dhan_request("LTP")
     response = requests.post(
         f"{API_BASE}/marketfeed/ltp",
         headers=build_headers(conn, include_client_id=True),
@@ -819,6 +821,26 @@ def fetch_commodity_data(conn, security_id, start, end, interval="min"):
 # Orders
 # --------------------------------------------------------------------------------
 
+class DhanRateLimited(Exception):
+    """
+    Dhan answered HTTP 429 (code 805, "Too many requests"). A separate type so that
+    @retry can re-run a function for THIS error only, after a pause, and leave every
+    other failure (bad token, bad request, timeout) to fail at once as before.
+    """
+
+
+def log_dhan_request(kind):
+    """
+    One console line per Dhan request, with the time to the millisecond.
+
+    Dhan counts requests per ACCOUNT, and several bots share the account. When a 429
+    happens, these lines (the Azure log already says which job printed each one) are
+    how to see what else was asking in the same second. Until the cause of the first
+    429s (2026-11-23, Interceptor, twice) is shown, it is only a guess.
+    """
+    print(f"Dhan {kind} request at {util.ist_now().strftime('%H:%M:%S.%f')[:-3]} IST", flush=True)
+
+
 def check_dhan_response(response):
     """
     Raise a useful error if Dhan rejected the request.
@@ -834,7 +856,9 @@ def check_dhan_response(response):
     with no way to tell a dead token (DH-901) from a bad request (DH-905) from Dhan
     failing to serve data (DH-907) - three different problems, one useless message.
 
-    This raises the same kind of error, with Dhan's own explanation attached.
+    This raises the same kind of error, with Dhan's own explanation attached. HTTP 429
+    raises DhanRateLimited, which is still an Exception, so every existing
+    `except Exception` behaves exactly as before.
     """
     if response.status_code < 400:
         return
@@ -845,9 +869,10 @@ def check_dhan_response(response):
     except Exception:
         detail = response.text
 
-    raise Exception(
-        f"Dhan returned HTTP {response.status_code} for {response.url} - {detail}"
-    )
+    message = f"Dhan returned HTTP {response.status_code} for {response.url} - {detail}"
+    if response.status_code == 429:
+        raise DhanRateLimited(message)
+    raise Exception(message)
 
 
 _last_depth_request = 0.0
@@ -881,16 +906,32 @@ def round_execution_price(price, tick, side):
     return float(result * Decimal(str(tick)))
 
 
-def get_depth(conn, security_id, exchange_segment):
+@retry(exceptions=DhanRateLimited, tries=3, delay=2, backoff=2)
+def get_depth(conn, security_id, exchange_segment, on_event=None):
+    """
+    A 429 is retried by the decorator: the same call again after 2 seconds, then
+    after 4 more, three attempts in all. Nothing else is retried here, because this
+    sits on the path to an order and a slow, repeated guess is worse than an error.
+    The pauses are deliberately not shorter: Dhan warns that further requests after
+    a 429 "may result in the user being blocked".
+    """
     global _last_depth_request
     wait = 1 - (time.monotonic() - _last_depth_request)
     if wait > 0:
         time.sleep(wait)
     _last_depth_request = time.monotonic()
+    log_dhan_request("quote")
     response = requests.post(
         f"{API_BASE}/marketfeed/quote", headers=build_headers(conn, include_client_id=True),
         json={exchange_segment: [int(security_id)]}, timeout=3)
-    check_dhan_response(response)
+    try:
+        check_dhan_response(response)
+    except DhanRateLimited as error:
+        # The decorator pauses and calls this function again; the final failure
+        # still reaches the caller as an error.
+        execution_event(on_event, f"Quote request got HTTP 429; asking again after a short pause"
+                        f" (three attempts at most) | {error}")
+        raise
     if time.monotonic() - _last_depth_request > 3:
         raise ValueError("Depth response too old for execution")
     data = response.json()
@@ -953,9 +994,9 @@ def depth_limit(quote, side, quantity, tick, max_price=None, entry=False,
 
 def prepare_order(conn, security_id, side, quantity, exchange_segment, product_type,
                   entry_deadline=None, correlation_id=None, best_price_first=False,
-                  check_spread=True):
+                  check_spread=True, on_event=None):
     tick = execution_tick(security_id, exchange_segment)
-    quote = get_depth(conn, security_id, exchange_segment)
+    quote = get_depth(conn, security_id, exchange_segment, on_event=on_event)
     received_at = time.time() if best_price_first else None
     entry = entry_deadline is not None
     if entry and side != "BUY":
@@ -1277,8 +1318,16 @@ def save_execution_quote(collection, key, snapshot):
             raise RuntimeError("Execution quote was not saved; refusing to reprice " + str(key))
 
 
+def execution_event(on_event, message, on_alert=None):
+    if on_event is not None:
+        on_event(message)
+    if on_alert is not None:
+        on_alert(message)
+
+
 def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
-                  slack_channel=None, prepared=None, audit_collection=None, audit_id=None):
+                  slack_channel=None, prepared=None, audit_collection=None, audit_id=None,
+                  on_event=None, on_alert=None, notification_state=None):
     """Monitor/reprice the same order for ten seconds; never replace it.
 
     Legacy arguments remain accepted for callers, but execution cadence is now two
@@ -1299,22 +1348,53 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
             raise ValueError("Unexpected broker order " + field)
     until = time.monotonic() + 10
     cancel_sent = False
+    modification_from = None
+    if notification_state is None:
+        notification_state = dict(repricings=0, warned=False)
     if policy.get("best_price_first") and order["orderStatus"] not in FINAL_ORDER_STATUSES:
         # Give the initial best bid/ask a chance before crossing deeper into the book.
         wait = 3
         if policy.get("deadline") is not None:
             wait = min(wait, max(0, policy["deadline"] - time.time()))
+        execution_event(on_event, f"Order {order_id} not fully filled at initial LIMIT"
+                        f" | filled {order['filledQty']}/{order['quantity']}"
+                        f" | allowing up to {wait:.1f}s at initial price")
+        if on_event is not None and policy.get("deadline") is not None:
+            wait = min(wait, max(0, policy["deadline"] - time.time()))
         time.sleep(wait)
         order = checked_order(conn, order_id, expected)
     while True:
         expected["filledQty"] = order["filledQty"]
+        execution_event(on_event, f"Broker status {order['orderStatus']} | ID {order_id}"
+                        f" | filled {order['filledQty']}/{order['quantity']}"
+                        f" | remaining {order['quantity'] - order['filledQty']}")
         if order["orderStatus"] in FINAL_ORDER_STATUSES:
             return order
+        if (on_alert is not None and notification_state["repricings"] >= 2
+                and not notification_state["warned"]
+                and order["orderStatus"] in ("PENDING", "PART_TRADED")):
+            execution_event(on_event, f"Still not fully filled after "
+                            f"{notification_state['repricings']} accepted repricing requests"
+                            f" | ID {order_id} | filled {order['filledQty']}/{order['quantity']}"
+                            f" | remaining {order['quantity'] - order['filledQty']}"
+                            f" | latest broker LIMIT Rs{float(order['price']):.2f}", on_alert)
+            notification_state["warned"] = True
         expired = policy.get("deadline") is not None and time.time() >= policy["deadline"]
         if expired and not cancel_sent:
-            cancel_order(conn, order_id)
+            execution_event(on_event, f"Entry deadline reached | ID {order_id}"
+                            " | requesting cancellation; fills must still be reconciled", on_alert)
+            try:
+                cancel_order(conn, order_id)
+            except Exception as error:
+                execution_event(on_event, f"Cancellation failed/unconfirmed | ID {order_id}"
+                                f" | check same order | {util.exception_detail(error)}", on_alert)
+                raise
             cancel_sent = True
+            execution_event(on_event, f"Cancellation request returned | ID {order_id}"
+                            " | awaiting broker confirmation", on_alert)
         if time.monotonic() >= until:
+            execution_event(on_event, f"Monitoring pass ended without a terminal result | ID {order_id}"
+                            " | order may still be working; same-order recovery required")
             warn_order_never_filled(order, slack_channel)
             return order
         if not expired and not cancel_sent and order["orderStatus"] in ("PENDING", "PART_TRADED"):
@@ -1326,8 +1406,14 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
                 raise ValueError("Nonterminal order has no remaining quantity")
             snapshot = dict(remaining_quantity=remaining, order_price_before=order["price"],
                             filled_quantity=order["filledQty"], order_id=str(order_id))
+            execution_event(on_event, f"Order {order_id} still not fully filled"
+                            f" | remaining {remaining} | requesting fresh depth for repricing")
+            quote_received = None
             try:
-                quote = get_depth(conn, order["securityId"], order["exchangeSegment"])
+                quote = get_depth(conn, order["securityId"], order["exchangeSegment"],
+                                  on_event=on_event)
+                if on_event is not None:
+                    quote_received = time.monotonic()
                 snapshot["quote"] = quote
                 if audit_collection is not None:
                     snapshot["received_at"] = time.time()
@@ -1336,27 +1422,93 @@ def wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003,
                                        entry=policy.get("deadline") is not None,
                                        check_spread=policy.get("check_spread", True))
             except ValueError as error:
+                execution_event(on_event, f"Repricing quote/pricing invalid | ID {order_id}"
+                                f" | no modification sent | {error}", on_alert)
                 snapshot["error"] = str(error)
                 save_execution_quote(audit_collection, audit_id, snapshot)
                 if policy.get("deadline") is None:
                     raise
                 print(f"Entry {order_id} cancelled: {error}", flush=True)
-                cancel_order(conn, order_id)
+                execution_event(on_event, f"Requesting entry cancellation | ID {order_id}"
+                                " | broker fill/cancel confirmation still required", on_alert)
+                try:
+                    cancel_order(conn, order_id)
+                except Exception as cancel_error:
+                    execution_event(on_event, f"Cancellation failed/unconfirmed | ID {order_id}"
+                                    f" | check same order | {util.exception_detail(cancel_error)}", on_alert)
+                    raise
                 cancel_sent = True
+                execution_event(on_event, f"Cancellation request returned | ID {order_id}"
+                                " | awaiting broker confirmation", on_alert)
                 order = checked_order(conn, order_id, expected)
                 expected["filledQty"] = order["filledQty"]
                 continue
+            except Exception as error:
+                execution_event(on_event, f"Repricing quote request failed | ID {order_id}"
+                                f" | no modification sent | {util.exception_detail(error)}", on_alert)
+                raise
             snapshot.update(reference=reference, limit_price=price)
-            save_execution_quote(audit_collection, audit_id, snapshot)
+            execution_event(on_event, f"Fresh repricing depth received | ID {order_id}"
+                            f" | reference Rs{reference:.2f} | candidate LIMIT Rs{price:.2f}")
+            try:
+                save_execution_quote(audit_collection, audit_id, snapshot)
+            except Exception as error:
+                execution_event(on_event, f"Repricing audit failed | ID {order_id}"
+                                f" | modification refused | {util.exception_detail(error)}", on_alert)
+                raise
+            if audit_collection is not None:
+                execution_event(on_event, f"Repricing quote saved | ID {order_id}"
+                                " | candidate is not yet an order modification")
             # Quotes take time; recheck status and deadline before modifying.
             order = checked_order(conn, order_id, expected)
             expected["filledQty"] = order["filledQty"]
             if order["orderStatus"] in FINAL_ORDER_STATUSES:
+                execution_event(on_event, f"Order {order_id} became {order['orderStatus']} "
+                                "while evaluating quote | modification skipped")
                 continue
             if policy.get("deadline") is not None and time.time() >= policy["deadline"]:
+                execution_event(on_event, f"Entry deadline reached during repricing | ID {order_id}"
+                                " | modification skipped")
                 continue
             if (order["orderStatus"] in ("PENDING", "PART_TRADED")
                     and float(order["price"]) != price):
-                modify_order(conn, order_id, "LIMIT", order["quantity"], price)
+                execution_event(on_event, f"Requesting LIMIT modification | ID {order_id}"
+                                f" | Rs{float(order['price']):.2f} -> Rs{price:.2f}"
+                                f" | total Qty {order['quantity']} unchanged"
+                                f" | filled {order['filledQty']}, remaining "
+                                f"{order['quantity'] - order['filledQty']}")
+                # A synchronous notification can consume the quote's useful life or BUY deadline.
+                if (on_event is not None and policy.get("deadline") is not None
+                        and time.time() >= policy["deadline"]):
+                    execution_event(on_event, f"Entry deadline reached during notification | ID {order_id}"
+                                    " | modification skipped")
+                    continue
+                if quote_received is not None and time.monotonic() - quote_received > 3:
+                    execution_event(on_event, f"Repricing depth expired during notifications | ID {order_id}"
+                                    " | modification skipped; fresh quote required")
+                    continue
+                try:
+                    modify_order(conn, order_id, "LIMIT", order["quantity"], price)
+                except Exception as error:
+                    execution_event(on_event, f"Modification failed/unconfirmed | ID {order_id}"
+                                    f" | reconcile same order | {util.exception_detail(error)}", on_alert)
+                    raise
+                notification_state["repricings"] += 1
+                modification_from = float(order["price"])
+                execution_event(on_event, f"Modification response received | ID {order_id}"
+                                " | awaiting broker-confirmed LIMIT and fills")
+            else:
+                execution_event(on_event, f"No LIMIT modification sent | ID {order_id}"
+                                f" | broker status {order['orderStatus']}; price unchanged or not modifiable")
         time.sleep(2)
         order = checked_order(conn, order_id, expected)
+        if modification_from is not None and "price" in order:
+            if float(order["price"]) != float(modification_from):
+                execution_event(on_event, f"Broker-confirmed LIMIT changed | ID {order_id}"
+                                f" | Rs{modification_from:.2f} -> Rs{float(order['price']):.2f}"
+                                f" | status {order['orderStatus']}"
+                                f" | filled {order['filledQty']}/{order['quantity']}")
+                modification_from = None
+            else:
+                execution_event(on_event, f"Broker still reports LIMIT Rs{float(order['price']):.2f}"
+                                f" | ID {order_id} | modification not yet confirmed")

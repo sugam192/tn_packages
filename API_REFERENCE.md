@@ -216,7 +216,9 @@ Network operations and range/interval limits are inherited; other names raise
 `get_ltp(conn, security_id, exchange_segment)`
 
 Return `last_price` as float rounded to two decimals from Dhan's LTP endpoint.
-Sends client-ID headers, uses a 30-second timeout and five-attempt retry.
+Prints one `Dhan LTP request at HH:MM:SS.mmm IST` line (see `log_dhan_request`).
+Sends client-ID headers, uses a 30-second timeout and five-attempt retry (5, 10,
+20 and 40 seconds between attempts; every error type, a 429 included, as before).
 Requires an integer-convertible ID and the expected response keys. A returned
 LTP has no freshness, spread or executable-depth guarantee.
 
@@ -279,15 +281,32 @@ underlying retries and date/interval limits. Covers only the specified
 contract, not a continuous back-adjusted series. No rollover stitching or
 physical-unit multiplication is performed.
 
+### connect_dhan.log_dhan_request
+
+`log_dhan_request(kind)`
+
+Print one console line, `Dhan <kind> request at HH:MM:SS.mmm IST` (naive India
+time from `utils.ist_now`), and return `None`. Called by `get_depth` (`quote`),
+`get_ltp` (`LTP`) and the candle chunk fetch (`candles`) just before each request.
+Dhan counts requests per **account** and several bots share it, so after a 429
+these lines, together with the Azure log's job name, show what else was asking in
+the same second. It diagnoses; it does not throttle.
+
 ### connect_dhan.check_dhan_response
 
 `check_dhan_response(response)`
 
-Return `None` for HTTP status below 400; otherwise raise a generic `Exception`
-containing status, URL and JSON body (or raw text if JSON decoding fails).
-Works on an already obtained response; sends no request. Despite historical
-docstring wording, this does not raise `requests.HTTPError`. A 2xx application
-error is not detected here. Error text may contain sensitive response data.
+Return `None` for HTTP status below 400; otherwise raise an `Exception` whose
+text starts `Dhan returned HTTP <status> for <url> - <body>` (JSON, or raw text if
+JSON decoding fails). Works on an already obtained response; sends no request.
+Despite historical docstring wording, this does not raise `requests.HTTPError`.
+A 2xx application error is not detected here. Error text may contain sensitive
+response data.
+
+**HTTP 429 raises `DhanRateLimited`**, a subclass of `Exception` with the same
+message, so every existing `except Exception` behaves as before. Its only purpose
+is to let `@retry(exceptions=DhanRateLimited, ...)` re-run a function for that one
+error after a pause (see `get_depth`).
 
 ### connect_dhan.execution_number
 
@@ -317,13 +336,27 @@ price can round to zero; this function alone is not a full order validator.
 
 ### connect_dhan.get_depth
 
-`get_depth(conn, security_id, exchange_segment)`
+`get_depth(conn, security_id, exchange_segment, on_event=None)`
 
 Return the instrument's quote dictionary, including `depth` and circuit limits,
 from the marketfeed quote endpoint. Sleeps to space requests by at least one
 second within this module/process; no cross-process rate coordination or lock.
+Prints one `Dhan quote request at ...` line per attempt (`log_dhan_request`).
 Uses a three-second timeout, requires response `status == "success"` and rejects
-elapsed response time over three seconds. No automatic retry. Elapsed-time
+elapsed response time over three seconds.
+
+**Decorated with `@retry(exceptions=DhanRateLimited, tries=3, delay=2, backoff=2)`:**
+after an HTTP 429 the function runs again with the same arguments after 2 seconds,
+then after 4 more - three attempts in all - and the last 429 is raised to the
+caller. The pauses are not shorter because Dhan warns that further requests after
+a 429 may get the user blocked. **Only a 429 is retried**; a bad request, an error
+status or a stale response fails at once. Each attempt's wait repeats the one-second
+spacing, so a caller can wait up to about 8 seconds in total. Entry deadlines are
+enforced by the callers (`prepare_order`, `wait_for_fill`), not by this function.
+
+If `on_event` is supplied it is called once per 429 with
+`Quote request got HTTP 429; asking again after a short pause ...`, including on
+the final attempt, whose failure also reaches the caller as an error. Elapsed-time
 checking does not prove exchange-timestamp freshness.
 
 ### connect_dhan.depth_limit
@@ -350,7 +383,7 @@ it neither fetches a quote nor guarantees a fill.
 
 ### connect_dhan.prepare_order
 
-`prepare_order(conn, security_id, side, quantity, exchange_segment, product_type, entry_deadline=None, correlation_id=None, best_price_first=False, check_spread=True)`
+`prepare_order(conn, security_id, side, quantity, exchange_segment, product_type, entry_deadline=None, correlation_id=None, best_price_first=False, check_spread=True, on_event=None)`
 
 **Network operation, but does not submit an order.** Read strict master tick and
 live depth, then return `{"request": body, "policy": policy}` for a LIMIT/DAY
@@ -368,7 +401,9 @@ limit price. It also sets the policy flag used by `wait_for_fill`.
 subsequent repricing; the choice is saved in `policy`. Older saved policies
 without this flag retain the spread check.
 Validation/depth/master errors propagate. Returned request contains client ID;
-do not publish it.
+do not publish it. `on_event` is passed to `get_depth`, so each HTTP 429 retry of
+the preparation quote is reported through it; the quote is still requested only
+before anything is submitted, and preparation raises if every attempt fails.
 
 ### connect_dhan.submit_prepared_order
 
@@ -514,9 +549,19 @@ acknowledgement. Database errors propagate; unacknowledged writes raise
 `RuntimeError` to stop repricing. Avoid an `order_key` key inside `snapshot`,
 which conflicts with the explicit keyword during dictionary construction.
 
+### connect_dhan.execution_event
+
+`execution_event(on_event, message, on_alert=None)`
+
+**Internal notification adapter.** Return `None`. If a callback is supplied,
+invoke it synchronously with the message; otherwise do nothing. An optional
+alert callback is invoked afterward for the same message. Callback
+errors propagate. Callbacks can add latency and must not submit replacement
+orders or mutate the broker policy.
+
 ### connect_dhan.wait_for_fill
 
-`wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003, slack_channel=None, prepared=None, audit_collection=None, audit_id=None)`
+`wait_for_fill(conn, order_id, tries=5, delay=1, chases=3, step=0.003, slack_channel=None, prepared=None, audit_collection=None, audit_id=None, on_event=None, on_alert=None, notification_state=None)`
 
 **Live monitoring/repricing operation.** Return a validated broker order
 dictionary, terminal **or nonterminal**. Checks identity against
@@ -540,6 +585,30 @@ remain working, including after a cancellation request. The caller still owns
 reconciliation and all partial positions. Terminal REJECTED/CANCELLED/EXPIRED
 does not mean fully filled. HTTP/validation failures can exit with an order
 still live; do not treat exceptions as proof that no position exists.
+
+Local version2.4.7 adds optional synchronous `on_event(message)` callbacks
+for initial unfilled status, partial fills, repricing quote requests/results,
+HTTP 429 retries of the repricing quote (passed on to `get_depth`),
+audit acknowledgement, modification requests/responses and broker-confirmed
+price changes, skipped modification/fill races, cancellation and unresolved
+monitoring passes. A modification response is not a fill or proof of a changed
+broker price. Default callers have no callback and retain existing behavior.
+Optional `on_alert(message)` receives quote/audit/modification errors,
+cancellation requests/unconfirmed responses, and one warning when a subsequent
+broker check still reports PENDING/PART_TRADED after two accepted modification
+requests. Quote evaluations, unchanged prices, skipped or failed modifications
+do not count; a full fill after the second modification suppresses the warning.
+To retain counts across monitoring passes, supply the same mutable
+`notification_state` dictionary initialized as `{"repricings": 0, "warned": False}`.
+Without it, counts are local to the pass. This is notification state only;
+it never changes broker policy, sizing, deadlines or the number of repricings.
+Interceptor retains it in process memory per order, logs routine events
+immediately and batches their Slack timeline after monitoring/persistence.
+Counts are not reconstructed after a process restart. No new Mongo fields.
+With a callback, BUY deadlines are rechecked after the modification notice;
+depth older than three seconds since receipt is not used for modification.
+Slow callbacks may still delay reconciliation or exits; this is not a
+guaranteed wall-clock deadline or fill. The new release is not published here.
 
 ## connect_definedge
 
